@@ -354,8 +354,8 @@ BANK_ALIAS: dict[str, str] = {
     "vrb":"vrb","vietnga":"vrb",
     # Nonghyup
     "nonghyup":"nonghyup",
-    # Vikki Digital Bank / former DongA Bank
-    "vikki":"dab","vikkibank":"dab","donga":"dab","dongasean":"dab",
+    # Vikki Digital Bank 
+    "vikki":"vikki","vikkibank":"vikki","vikkidigitalbank": "vikki","vikibank": "vikki",
     # PGBank
     "pgbank":"pgb","pgb":"pgb","petrolimex":"pgb","xangdau":"pgb",
     # SaigonBank (SGBL) — alias thực tế: svb
