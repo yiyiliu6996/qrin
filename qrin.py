@@ -2676,17 +2676,10 @@ async def cb_wl_cancel(callback: CallbackQuery) -> None:
 @dp.message(F.photo | F.document)
 async def handle_bill_file(message: Message, bot: Bot) -> None:
     """
-    Xử lý bill trong Group Collect.
-
-    Ưu tiên:
-    1. Reply bill vào card collect → xác nhận theo card, OCR chỉ phụ trợ.
-    2. Bill kèm mã đơn trong caption → xác nhận theo mã, OCR chỉ phụ trợ.
-    3. Không có card/mã → Claude đọc bill, auto match STK nhận + số tiền.
-
-    Nhận:
-    - Telegram photo
-    - Document ảnh: jpg/jpeg/png/webp
-    - Document PDF: đọc tối đa 3 trang đầu
+    Xử lý bill trong Group Collect — không OCR.
+    Nhân viên xác nhận bằng cách:
+      1. Gửi ảnh bill kèm mã đơn trong caption (VD: W16044437)
+      2. Reply ảnh bill vào card đơn trong group collect
     """
     if not message.from_user:
         return
@@ -2696,124 +2689,40 @@ async def handle_bill_file(message: Message, bot: Bot) -> None:
     is_photo = bool(message.photo)
     doc = message.document
     mime = (doc.mime_type or "").lower() if doc else ""
-    file_name = (doc.file_name or "") if doc else ""
-    ext = Path(file_name).suffix.lower()
+    is_image_doc = bool(doc and mime.startswith("image/"))
 
-    is_image_doc = bool(doc and (mime in SUPPORTED_IMAGE_MIME or ext in SUPPORTED_IMAGE_EXT))
-    is_pdf_doc = bool(doc and (mime == "application/pdf" or ext == ".pdf"))
-
-    if not is_photo and not is_image_doc and not is_pdf_doc:
+    if not is_photo and not is_image_doc:
         return
 
     caption_text = message.caption or ""
 
-    # Ưu tiên 1: reply bill vào card collect
-    replied_order = None
-    if message.reply_to_message:
-        replied_order = get_order_by_collect_message(message.reply_to_message.message_id)
-
-    # Ưu tiên 2: bill kèm mã đơn trong caption
+    # Ưu tiên 1: caption có mã đơn
     code = extract_order_code(caption_text)
-    code_order = get_order_by_code_for_confirm(code) if code else None
-
-    direct_order = replied_order or code_order
-
-    tmp = None
-    bill: Optional[Bill] = None
-
-    try:
-        # Download file từ Telegram
-        if is_photo:
-            file_id = message.photo[-1].file_id
-            suffix = ".jpg"
-        else:
-            file_id = doc.file_id
-            if is_pdf_doc:
-                suffix = ".pdf"
-            elif ext:
-                suffix = ext
-            else:
-                suffix = ".jpg"
-
-        file_info = await bot.get_file(file_id)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-            tmp = f.name
-        await bot.download_file(file_info.file_path, destination=tmp)
-
-        # OCR luôn thử đọc, nhưng không bắt buộc nếu có card/mã đơn
-        try:
-            bill = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: call_claude_bill_any_file(tmp)
-            )
-        except anthropic.AuthenticationError:
-            raise
-        except anthropic.RateLimitError:
-            raise
-        except Exception as ocr_err:
-            logger.warning("OCR bill lỗi, thử xác nhận thủ công nếu có card/mã: %s", ocr_err)
-            bill = None
-
-        # Có reply card hoặc caption mã đơn → xác nhận trực tiếp
-        if direct_order:
-            await confirm_order_row(bot, direct_order, message, bill=bill)
-            return
-
-        # Không có card/mã → bắt buộc cần OCR để tự match
-        if not bill:
+    if code:
+        row = get_order_by_code_for_confirm(code)
+        if not row:
             await message.reply(
-                "⚠️ Không đọc được bill.\n\n"
-                "📌 Cách xác nhận thủ công:\n"
-                "1. Reply bill vào card đơn trong group collect\n"
-                "2. Hoặc gửi bill kèm mã đơn, ví dụ: <code>W16044437</code>",
+                f"❌ Không tìm thấy mã đơn <code>{code}</code>.",
                 parse_mode=ParseMode.HTML,
             )
             return
+        await confirm_order_row(bot, row, message, bill=None)
+        return
 
-        if not bill.is_bill:
+    # Ưu tiên 2: reply vào card đơn
+    if message.reply_to_message:
+        row = get_order_by_collect_message(message.reply_to_message.message_id)
+        if row:
+            await confirm_order_row(bot, row, message, bill=None)
             return
 
-        matched = find_order_by_bill(bill)
-        if not matched:
-            err_lines = ["⚠️ <b>Không khớp đơn nào</b>"]
-            if bill.receiver_account:
-                err_lines.append(f"STK đọc được: <code>{bill.receiver_account}</code>")
-            if bill.amount:
-                err_lines.append(f"Số tiền: <code>{format_money(bill.amount)}</code>")
-            if bill.receiver_bank:
-                err_lines.append(f"Bank nhận: <b>{bill.receiver_bank}</b>")
-            if bill.confidence:
-                err_lines.append(f"Độ tin cậy OCR: <code>{bill.confidence:.2f}</code>")
-            if bill.note:
-                err_lines.append(f"Ghi chú OCR: {bill.note}")
-            err_lines.append(
-                "\n📌 Cách xác nhận thủ công:\n"
-                "1. Reply bill vào card đơn\n"
-                "2. Hoặc gửi lại bill kèm mã đơn, ví dụ: <code>W16044437</code>"
-            )
-            await message.reply("\n".join(err_lines), parse_mode=ParseMode.HTML)
-            return
-
-        await confirm_order_row(bot, matched, message, bill=bill)
-
-    except anthropic.AuthenticationError:
-        await message.reply("❌ ANTHROPIC_API_KEY không hợp lệ.")
-    except anthropic.RateLimitError:
-        await message.reply("⚠️ Claude API đang quá tải hoặc hết quota, thử lại sau.")
-    except Exception as e:
-        logger.error("Lỗi đọc bill: %s", e)
-        await message.reply(
-            f"❌ Lỗi đọc bill: {e}\n\n"
-            "📌 Cách xác nhận thủ công:\n"
-            "1. Reply bill vào card đơn\n"
-            "2. Hoặc gửi bill kèm mã đơn, ví dụ: <code>W16044437</code>",
-            parse_mode=ParseMode.HTML,
-        )
-    finally:
-        if tmp:
-            try:
-                Path(tmp).unlink(missing_ok=True)
-            except Exception:
-                pass
+    # Không có mã / reply → hướng dẫn
+    await message.reply(
+        "📌 Để xác nhận bill, bạn iu làm 1 trong 2 cách:\n"
+        "1. Gửi ảnh bill kèm mã đơn trong caption, ví dụ: <code>W16044437</code>\n"
+        "2. Reply ảnh bill vào card đơn trong group này 🩷",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def confirm_order_row(
