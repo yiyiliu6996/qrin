@@ -1,13 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════╗
-║              QRin  —  by Claude                      ║
-║  Tạo QR chuyển khoản 1-1 qua Telegram Bot            ║
-║  1 TK chuyển → 1 TK nhận, 1 QR mỗi đơn              ║
+║              outqrbot  V6  —  by Claude              ║
+║  Tạo QR chuyển khoản hàng loạt qua Telegram Bot     ║
 ╚══════════════════════════════════════════════════════╝
 """
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -16,14 +14,12 @@ import sqlite3
 import tempfile
 import time
 from collections import defaultdict
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
 import aiohttp
-import anthropic
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -49,7 +45,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("qrin")
+logger = logging.getLogger("outqrbot")
 
 # ─────────────────────────── ĐỌC CONFIG TỪ config.json ───────────────────────
 
@@ -63,22 +59,11 @@ def _load_config() -> dict:
     if os.environ.get("BOT_TOKEN"):
         ids_raw = os.environ.get("SUPER_ADMIN_IDS", "")
         super_ids = [int(x.strip()) for x in ids_raw.split(",") if x.strip().isdigit()]
-        # COLLECT_GROUPS: "QR_ID:COLLECT_ID,QR_ID2:COLLECT_ID2"
-        collect_groups_raw = os.environ.get("COLLECT_GROUPS", "")
-        collect_groups = {}
-        for pair in collect_groups_raw.split(","):
-            pair = pair.strip()
-            if ":" in pair:
-                qr_id, col_id = pair.split(":", 1)
-                try:
-                    collect_groups[int(qr_id.strip())] = int(col_id.strip())
-                except ValueError:
-                    pass
         return {
             "BOT_TOKEN":                os.environ["BOT_TOKEN"].strip(),
             "SUPER_ADMIN_IDS":          super_ids,
             "NOTIFY_GROUP_ID":          int(os.environ.get("NOTIFY_GROUP_ID", "0") or 0),
-            "COLLECT_GROUPS":           collect_groups,
+            "COLLECT_GROUP_ID":         int(os.environ.get("COLLECT_GROUP_ID", "0") or 0),
             "DEFAULT_TRANSFER_CONTENT": os.environ.get("DEFAULT_TRANSFER_CONTENT", ""),
             "FORM_COOLDOWN_SECONDS":    int(os.environ.get("FORM_COOLDOWN_SECONDS", "3") or 3),
             "BANK_WHITELIST_ENABLED":   os.environ.get("BANK_WHITELIST_ENABLED", "false").lower() == "true",
@@ -97,16 +82,14 @@ def _load_config() -> dict:
 
 _cfg = _load_config()
 
-BOT_TOKEN:               str           = _cfg["BOT_TOKEN"]
-SUPER_ADMIN_IDS:         set[int]      = set(_cfg["SUPER_ADMIN_IDS"])
-NOTIFY_GROUP_ID:         int           = _cfg["NOTIFY_GROUP_ID"]
-# Map: QR chat_id → Collect chat_id (có thể nhiều cặp)
-COLLECT_GROUPS:          dict[int,int] = _cfg.get("COLLECT_GROUPS", {})
-BANK_WHITELIST_ENABLED:  bool          = bool(_cfg.get("BANK_WHITELIST_ENABLED", False))
-WHITELIST_MODE:          str           = _cfg.get("WHITELIST_MODE", "blacklist")
-DEFAULT_TRANSFER_CONTENT: str          = _cfg.get("DEFAULT_TRANSFER_CONTENT", "")
-FORM_COOLDOWN_SECONDS:   int           = _cfg.get("FORM_COOLDOWN_SECONDS", 3)
-ANTHROPIC_KEY:           str           = os.environ.get("ANTHROPIC_API_KEY", _cfg.get("ANTHROPIC_API_KEY", ""))
+BOT_TOKEN:               str      = _cfg["BOT_TOKEN"]
+SUPER_ADMIN_IDS:         set[int] = set(_cfg["SUPER_ADMIN_IDS"])
+NOTIFY_GROUP_ID:         int      = _cfg["NOTIFY_GROUP_ID"]
+COLLECT_GROUP_ID:        int      = _cfg.get("COLLECT_GROUP_ID", 0)
+BANK_WHITELIST_ENABLED:  bool     = bool(_cfg.get("BANK_WHITELIST_ENABLED", False))
+WHITELIST_MODE:          str      = _cfg.get("WHITELIST_MODE", "blacklist")  # "blacklist" hoặc "strict"
+DEFAULT_TRANSFER_CONTENT: str     = _cfg.get("DEFAULT_TRANSFER_CONTENT", "")
+FORM_COOLDOWN_SECONDS:   int      = _cfg.get("FORM_COOLDOWN_SECONDS", 3)
 
 # Validate
 if not BOT_TOKEN:
@@ -154,15 +137,10 @@ def init_db() -> None:
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS activated_chats (
-        chat_id          INTEGER PRIMARY KEY,
-        activated_by     INTEGER NOT NULL,
-        activated_at     TEXT NOT NULL,
-        collect_group_id INTEGER
+        chat_id      INTEGER PRIMARY KEY,
+        activated_by INTEGER NOT NULL,
+        activated_at TEXT NOT NULL
     )""")
-    try:
-        cur.execute("ALTER TABLE activated_chats ADD COLUMN collect_group_id INTEGER")
-    except Exception:
-        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS orders (
@@ -278,39 +256,7 @@ def init_db() -> None:
     conn.close()
     logger.info("DB khởi tạo xong: %s", DB_PATH)
 
-def is_collect_group(chat_id: int) -> bool:
-    """Kiểm tra chat_id có phải Group Collect của bất kỳ Group QR nào không."""
-    # Check trong DB
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM activated_chats WHERE collect_group_id=?", (chat_id,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return True
-    # Check trong config
-    return chat_id in COLLECT_GROUPS.values()
-
-
-def get_qr_group_by_collect(collect_chat_id: int) -> Optional[int]:
-    """Lấy Group QR chat_id tương ứng với collect_chat_id."""
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT chat_id FROM activated_chats WHERE collect_group_id=?", (collect_chat_id,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return row["chat_id"]
-    for qr_id, col_id in COLLECT_GROUPS.items():
-        if col_id == collect_chat_id:
-            return qr_id
-    return None
-
-
-
-
-
-
+# ─────────────────────────── BANK DATA ───────────────────────────────────────
 
 # ── Bảng mã ngân hàng: mọi cách gõ → mã chuẩn VietQR ────────────────────────
 BANK_ALIAS: dict[str, str] = {
@@ -371,9 +317,12 @@ BANK_ALIAS: dict[str, str] = {
     "kienlongbank":"klb","klb":"klb","kienlong":"klb","umee":"klb",
     # VietBank
     "vietbank":"vietbank","thuongtin":"vietbank",
-    # BaoViet Bank
-    "baovietbank":"bvb","baoviet":"bvb","baoviet":"bvb",
-    # CBBank
+    # BaoViet Bank — KHÔNG dùng bvb
+    "baovietbank":"baoviet","baoviet":"baoviet","bvbank":"baoviet","baovietbnk":"baoviet",
+    # VietCapitalBank (Bản Việt) — bvb = Bản Việt
+    "vietcapitalbank":"vcapital","bancviet":"vcapital","banviet":"vcapital",
+    "bvb":"vcapital","bvb2":"vcapital","vietcapital":"vcapital","vikki":"vcapital",
+    "banvietbank":"vcapital","nganhangbanviet":"vcapital",
     "cbbank":"cbb","cbb":"cbb","xaydung":"cbb",
     # OceanBank
     "oceanbank":"oceanbank","ocean":"oceanbank","daididuong":"oceanbank",
@@ -403,16 +352,15 @@ BANK_ALIAS: dict[str, str] = {
     "vrb":"vrb","vietnga":"vrb",
     # Nonghyup
     "nonghyup":"nonghyup",
-    # Vikki Digital Bank 
-    "vikki":"vikki","vikkibank":"vikki","vikkidigitalbank": "vikki","vikibank": "vikki",
+    # DongA Bank
+    "dongabank":"dab","dab":"dab","donga":"dab","dongasean":"dab",
     # PGBank
     "pgbank":"pgb","pgb":"pgb","petrolimex":"pgb","xangdau":"pgb",
     # SaigonBank (SGBL) — alias thực tế: svb
     "saigonbanksgbl":"sgbl","sgbl":"sgbl","saigoncongth":"sgbl","saigonbk":"sgbl",
     # SVB = ShinhanBank (thực tế alias dùng phổ biến)
     "svb": "shbvn",
-    # VietCapitalBank
-    "vietcapitalbank":"vccb","bvbank":"vccb","banviet":"vccb","banvietbank": "vccb","vietcapital": "vccb","bvb": "vccb",
+
     # ViettelMoney
     "viettelmoney":"viettelm","viettelm":"viettelm",
     # VNPTMoney
@@ -443,6 +391,25 @@ BANK_ALIAS: dict[str, str] = {
     "citibank":"citibank","citibankhn":"citibank",
     # BNPHN/BNPHCM
     "bnp":"bnphn","bnphn":"bnphn","bnphcm":"bnphcm",
+    # Alias bổ sung từ danh sách VietQR
+    "mbbank":"mb","mbnk":"mb",                            # MB thêm
+    "saigonbanksgbl":"sgbl","sgbl":"sgbl",                # SaigonBank
+    "scbbank":"scb","saigon":"scb",                       # SCB thêm
+    "seab":"seab","seabank":"seab",                       # SeABank đã có
+    "pgbank":"pgb","petrolimexbank":"pgb",                # PGBank thêm
+    "dongabank":"dab","dongabnk":"dab",                   # DongA thêm
+    "vietbanktn":"vietbank","vtb":"vietbank",             # VietBank thêm
+    "pvcom":"pvcb","pvcombnk":"pvcb",                     # PVcom thêm
+    "namabnk":"nab","namaviet":"nab",                     # NamA thêm
+    "kienlongbnk":"klb","kienlong":"klb",                 # KienLong thêm
+    "lpbnk":"lpb","locphatbank":"lpb",                    # LP thêm
+    "vttmoney":"viettelm","vtmoney":"viettelm",           # Viettel thêm
+    "vnptfintech":"vnptm","vnptfin":"vnptm",              # VNPT thêm
+    "tpbnk":"tpb","tienphongbank":"tpb",                  # TP thêm
+    "liobankapp":"liobank",                               # Lio thêm
+    "ubankvpb":"ubank","ubankbyvpb":"ubank",              # Ubank thêm
+    "cakebank":"cake","cakevpb":"cake",                   # Cake thêm
+    "timobank":"timo","timobvb":"timo",                   # Timo thêm
 }
 
 def _vi_normalize(text: str) -> str:
@@ -459,6 +426,14 @@ def resolve_bank_code(raw: str) -> str:
         return BANK_ALIAS[key]
     vi_key = _vi_normalize(raw)
     return BANK_ALIAS.get(vi_key, key)
+
+def _vi_normalize(text: str) -> str:
+    """Chuẩn hoá tên có dấu tiếng Việt về ASCII để tra cứu."""
+    import unicodedata
+    # NFD decompose → strip combining → encode ASCII
+    nfd = unicodedata.normalize("NFD", text)
+    ascii_str = "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^a-z0-9]", "", ascii_str.lower())
 
 
 def looks_like_bank(line: str) -> bool:
@@ -547,38 +522,6 @@ def _looks_like_bank_code(line: str) -> bool:
     return bool(re.fullmatch(r"[a-zA-Z]{2,10}", line.strip()))
 
 
-def parse_two_info(name_line: str, bank_stk_line: str, label: str) -> Dict[str, str]:
-    """
-    Parse format 2 dòng:
-      Dòng 1: tên tài khoản
-      Dòng 2: bank + STK (dãy số dài nhất trong dòng = STK, phần còn lại = bank)
-
-    Không phân biệt dấu gạch, khoảng trắng hay ký tự đặc biệt.
-    """
-    name = name_line.strip()
-    if not name:
-        raise ValueError(f"{label}: tên tài khoản trống")
-
-    # Tìm dãy số dài nhất trong dòng → đó là STK
-    matches = re.findall(r'\d+', bank_stk_line)
-    if not matches:
-        raise ValueError(f"{label}: không tìm được STK trong '{bank_stk_line}'")
-
-    stk_match = max(matches, key=len)
-    if len(stk_match) < 6:
-        raise ValueError(f"{label}: STK quá ngắn trong '{bank_stk_line}'")
-
-    account = stk_match
-    # Bank = bỏ STK ra, dọn ký tự thừa
-    bank = re.sub(re.escape(stk_match), '', bank_stk_line)
-    bank = re.sub(r'[\-|/\s]+', ' ', bank).strip()
-
-    if not bank:
-        raise ValueError(f"{label}: không tìm được tên bank trong '{bank_stk_line}'")
-
-    return {"bank": bank, "account": account, "name": name}
-
-
 def parse_three_info(lines: List[str], label: str) -> Dict[str, str]:
     """
     Nhận diện bank / STK / tên trong 3 dòng (thứ tự bất kỳ).
@@ -634,8 +577,7 @@ def parse_three_info(lines: List[str], label: str) -> Dict[str, str]:
 def _raw_blocks_from_text(text: str) -> List[List[str]]:
     """
     Tách text thành các block theo dòng trống / separator.
-    Sau khi tách, nếu block chỉ có 1 dòng là số tiền → gộp vào block trước.
-    Xử lý trường hợp user nhập dòng trống giữa bank-STK và số tiền.
+    Mỗi block là 1 cụm liên tiếp không có dòng trống ở giữa.
     """
     blocks: List[List[str]] = []
     current: List[str] = []
@@ -652,256 +594,158 @@ def _raw_blocks_from_text(text: str) -> List[List[str]]:
     if current:
         blocks.append(current)
 
-    # Gộp block chỉ có số tiền vào block trước
-    merged: List[List[str]] = []
-    for blk in blocks:
-        if (len(blk) == 1
-                and parse_amount(blk[0]) is not None
-                and merged):
-            merged[-1].append(blk[0])
-        else:
-            merged.append(blk)
-
-    return merged
+    return blocks
 
 
 def _parse_block_fixed(lines: List[str], label: str, require_amount: bool = True) -> Dict[str, Any]:
     """
-    Parse cụm — hỗ trợ cả 2 format:
-
-    Format 2 dòng (mới):
-      dòng 1 : tên tài khoản
-      dòng 2 : bank - STK
-      dòng 3 : số tiền
-      dòng 4 : nội dung (tuỳ chọn)
-
-    Format 3 dòng (cũ):
+    Parse cụm theo rule CỐ ĐỊNH:
       dòng 1-3 : thứ tự bất kỳ trong {bank, STK, tên}
       dòng 4   : số tiền
       dòng 5   : nội dung (tuỳ chọn)
 
-    Detect tự động: nếu dòng 1 không có STK và dòng 2 có STK → format 2 dòng.
+    Nếu cụm chỉ có 3 dòng và require_amount=False → trả về không có amount.
     """
-    if len(lines) < 2:
-        raise ValueError(f"{label}: cụm phải có ít nhất 2 dòng, nhận {len(lines)}: {lines}")
+    if len(lines) < 3:
+        raise ValueError(f"{label}: cụm phải có ít nhất 3 dòng, nhận {len(lines)}: {lines}")
 
+    info_lines = lines[:3]
+    amount = None
     content = DEFAULT_TRANSFER_CONTENT
-    amount  = None
-    result  = None
 
-    # ── Detect format ────────────────────────────────────────────────────────
-    # Format 2 dòng chuẩn: dòng 1=tên, dòng 2=bank-STK
-    is_2line = (
-        len(lines) >= 2
-        and not _line_contains_stk(lines[0])
-        and _is_bank_stk_line(lines[1])
-    )
-
-    # Format 2 dòng biến thể: tên / bank / STK (bank và STK tách riêng)
-    is_2line_split = (
-        not is_2line
-        and len(lines) >= 3
-        and not _line_contains_stk(lines[0])
-        and not _line_contains_stk(lines[1])
-        and bool(re.search(r'[a-zA-ZÀ-ỹ]', lines[1]))
-        and bool(re.match(r'^\d{6,20}$', lines[2].strip()))
-    )
-
-    if is_2line:
-        result = parse_two_info(lines[0], lines[1], label)
-        rest   = lines[2:]
-    elif is_2line_split:
-        merged = f"{lines[1].strip()} {lines[2].strip()}"
-        result = parse_two_info(lines[0], merged, label)
-        rest   = lines[3:]
-    else:
-        # Format 3 dòng cũ
-        if len(lines) < 3:
-            raise ValueError(f"{label}: cụm phải có ít nhất 3 dòng, nhận {len(lines)}: {lines}")
-        result = parse_three_info(lines[:3], label)
-        rest   = lines[3:]
-
-    # ── Đọc số tiền + nội dung từ phần còn lại ───────────────────────────────
-    if rest:
-        amount = parse_amount(rest[0])
+    if len(lines) >= 4:
+        amount = parse_amount(lines[3])
         if amount is None and require_amount:
             raise ValueError(
-                f"{label}: dòng số tiền '{rest[0]}' không hợp lệ.\n"
+                f"{label}: dòng số tiền '{lines[3]}' không hợp lệ.\n"
                 f"Số tiền ghi dạng: 93,493,000"
             )
-        if len(rest) >= 2 and rest[1]:
-            content = rest[1]
     elif require_amount:
-        raise ValueError(f"{label}: thiếu dòng số tiền.")
+        raise ValueError(f"{label}: thiếu dòng số tiền (dòng thứ 4).")
 
+    if len(lines) >= 5 and lines[4]:
+        content = lines[4]
+
+    result = parse_three_info(info_lines, label)
     if amount is not None:
         result["amount"] = amount
     result["content"] = content
     return result
 
 
-def _line_contains_stk(line: str) -> bool:
-    """Dòng có chứa dãy số ≥ 6 ký tự liên tiếp = có STK."""
-    return bool(re.search(r'\d{6,}', line))
-
-
-def _is_bank_stk_line(line: str) -> bool:
-    """
-    Dòng chứa cả bank lẫn STK — phân biệt với STK thuần số.
-    Điều kiện: có dãy số ≥ 6 ký tự VÀ có chữ cái (tên bank).
-    """
-    has_stk  = bool(re.search(r'\d{6,}', line))
-    has_text = bool(re.search(r'[a-zA-ZÀ-ỹ]', line))
-    return has_stk and has_text
-
-
 def _extract_sender_lines(block: List[str]) -> tuple:
     """
-    Trích xuất thông tin người chuyển/nhận từ block.
-    Hỗ trợ theo thứ tự ưu tiên:
-      1. Format 2 dòng: dòng 1=tên, dòng 2=bank-STK (kể cả dính nhau: ncb-100812677734)
-      2. Format 1 dòng gộp: "TCB - 3346907593 - Bùi Đình Kiên"
-      3. Format 3 dòng riêng (thứ tự bất kỳ)
-
-    Trả về: (parsed_dict, leftover) hoặc (None, block)
+    Trích xuất 3 thành phần người chuyển từ block.
+    Hỗ trợ:
+      - 1 dòng gộp: "TCB - 3346907593 - Bùi Đình Kiên"
+                    "TCB|3346907593|Bùi Đình Kiên"
+      - 3 dòng riêng (thứ tự bất kỳ)
+    Trả về: (sender_lines: List[3], leftover: List) hoặc (None, block)
     """
-    # Thử format 2 dòng: dòng 1 không chứa STK, dòng 2 là bank-STK line
-    if len(block) >= 2:
-        line1, line2 = block[0], block[1]
-        if not _line_contains_stk(line1) and _is_bank_stk_line(line2):
-            try:
-                parsed = parse_two_info(line1, line2, "block")
-                return parsed, block[2:]
-            except ValueError:
-                pass
-
-    # Thử format 2 dòng biến thể: bank và STK trên 2 dòng riêng
-    # Ví dụ: "Phan Thị Thùy Linh" / "NCB -" / "100812677734"
-    # → gộp dòng 2+3 thành "NCB - 100812677734" rồi parse
-    if len(block) >= 3:
-        line1, line2, line3 = block[0], block[1], block[2]
-        line2_has_text = bool(re.search(r'[a-zA-ZÀ-ỹ]', line2))
-        line3_is_stk   = bool(re.match(r'^\d{6,20}$', line3.strip()))
-        if (not _line_contains_stk(line1)
-                and not _line_contains_stk(line2) and line2_has_text
-                and line3_is_stk):
-            merged_line = f"{line2.strip()} {line3.strip()}"
-            try:
-                parsed = parse_two_info(line1, merged_line, "block")
-                return parsed, block[3:]
-            except ValueError:
-                pass
-
-    # Thử 1 dòng gộp — tách theo dấu - | /
+    # Thử 1 dòng gộp — tách theo dấu -  |  /
     if len(block) >= 1:
         first = block[0]
         parts = re.split(r"\s*[-|/]\s+|\s+[-|/]\s*", first)
         parts = [p.strip() for p in parts if p.strip()]
         if len(parts) == 3:
+            # Xác nhận có đủ STK trong 3 phần
             has_stk = any(looks_like_account(p) for p in parts)
             if has_stk:
-                try:
-                    info = parse_three_info(parts, "block")
-                    return info, block[1:]
-                except ValueError:
-                    pass
+                return parts, block[1:]
 
     # Thử 3 dòng riêng
     if len(block) >= 3:
         candidate = block[:3]
-        has_stk  = any(_line_contains_stk(l) for l in candidate)
+        # Cần có ít nhất 1 STK và 1 bank trong 3 dòng
+        has_stk = any(looks_like_account(l) for l in candidate)
         has_bank = any(_in_bank_alias(l) or _looks_like_bank_code(l) for l in candidate)
         if has_stk and has_bank:
-            try:
-                info = parse_three_info(candidate, "block")
-                return info, block[3:]
-            except ValueError:
-                pass
+            return candidate, block[3:]
+        # Fallback: nếu có STK thì vẫn thử (bank có thể là tên tiếng Việt)
         if has_stk:
-            try:
-                info = parse_three_info(candidate, "block")
-                return info, block[3:]
-            except ValueError:
-                pass
+            return candidate, block[3:]
 
     return None, block
 
 
-def _block_has_amount(block: List[str]) -> bool:
-    """
-    Kiểm tra block có chứa dòng số tiền không.
-    Dùng is_clearly_money (phải có dấu phẩy/chấm hoặc đ) để tránh
-    nhầm STK thuần số (100812677734) với số tiền.
-    Kiểm tra từ index 2 trở đi để bao cả format 2 dòng lẫn 3 dòng.
-    """
-    for line in block[2:]:
-        if is_clearly_money(line):
-            return True
-    return False
-
-
-def _merge_receiver_blocks(raw_blocks: List[List[str]]) -> List[List[str]]:
-    """
-    Các block đã được tách sẵn bởi dòng trống — pass thẳng qua.
-    Nhưng nếu block chỉ có 2 dòng [tên, bank] và block tiếp theo
-    chỉ có [STK, tiền] thì KHÔNG gộp — đã được xử lý bởi _parse_block_fixed.
-    """
-    return [blk for blk in raw_blocks if blk]
-
-
 def parse_order_form(text: str) -> Dict[str, Any]:
     """
-    Parse form 1-1 đơn giản:
+    Parse form theo rule cố định:
+      Block đầu tiên (3 dòng) = người chuyển
+      Các block tiếp theo (4-5 dòng mỗi block) = người nhận
 
-      Block 1 (không có số tiền) = người chuyển
-      Block 2 (có số tiền)       = người nhận
-
-    Tách 2 block bằng dòng trống. Kết quả luôn là 1 QR duy nhất.
+    Block được tách bởi dòng trống hoặc separator (===, ---, >>>...).
     """
     raw_blocks = _raw_blocks_from_text(text)
 
     if not raw_blocks:
         raise ValueError("Form trống.")
 
-    if len(raw_blocks) < 2:
+    # Block đầu = người chuyển
+    # Hỗ trợ cả 2 dạng:
+    #   Dạng 1: 1 dòng gộp "TCB - 3346907593 - Bùi Đình Kiên"
+    #   Dạng 2: 3 dòng riêng (thứ tự bất kỳ)
+    sender_block = raw_blocks[0]
+    sender_lines, leftover = _extract_sender_lines(sender_block)
+    if sender_lines is None:
         raise ValueError(
-            "Form cần 2 block: người chuyển và người nhận.\n"
-            "Tách 2 block bằng dòng trống.\n\n"
-            "Ví dụ:\n"
-            "Nguyễn Văn A\n"
-            "VCB 1234567890\n\n"
-            "Trần Thị B\n"
-            "TCB 0987654321\n"
-            "500,000"
+            "Không nhận diện được thông tin người chuyển.\n"
+            "Cần có: tên ngân hàng, số tài khoản, tên tài khoản."
         )
+    sender = parse_three_info(sender_lines, "người chuyển")
 
-    # ── Block 1: người chuyển (không cần tiền) ────────────────────────────────
-    sender_parsed, _ = _extract_sender_lines(raw_blocks[0])
-    if sender_parsed is None:
-        raise ValueError(
-            "Không nhận diện được thông tin người chuyển (block 1).\n"
-            "Cần có: tên tài khoản, ngân hàng, số tài khoản."
-        )
+    # Các block còn lại = người nhận
+    receiver_blocks = raw_blocks[1:]
 
-    # ── Block 2: người nhận (có tiền) ─────────────────────────────────────────
-    rec = _parse_block_fixed(raw_blocks[1], "người nhận", require_amount=True)
-    rec["index"] = 1
+    # Nếu không có dòng trống tách block → phần dư sau sender là receiver
+    if not receiver_blocks:
+        body_lines = leftover
+        if not body_lines:
+            raise ValueError("Không tìm thấy thông tin người nhận.")
+        receiver_blocks = [body_lines[i:i+4] for i in range(0, len(body_lines), 4)]
+    else:
+        # Gộp tất cả dòng receiver → chia lại nhóm 4 (hoặc 5 nếu có nội dung)
+        all_recv_lines: List[str] = [line for blk in receiver_blocks for line in blk]
+        merged: List[List[str]] = []
+        i = 0
+        while i + 3 < len(all_recv_lines):
+            chunk = all_recv_lines[i:i+4]
+            # Kiểm tra dòng thứ 5: nếu không phải bank/STK/tiền → là nội dung
+            if (i+4 < len(all_recv_lines)
+                    and not looks_like_account(all_recv_lines[i+4])
+                    and not _in_bank_alias(all_recv_lines[i+4])
+                    and not _looks_like_bank_code(all_recv_lines[i+4])
+                    and parse_amount(all_recv_lines[i+4]) is None):
+                chunk = all_recv_lines[i:i+5]
+                i += 5
+            else:
+                i += 4
+            merged.append(chunk)
+        receiver_blocks = merged
+
+    if not receiver_blocks:
+        raise ValueError("Không tìm thấy thông tin người nhận.")
+
+    receivers = []
+    for i, blk in enumerate(receiver_blocks, 1):
+        rec = _parse_block_fixed(blk, f"người nhận đơn {i}", require_amount=True)
+        rec["index"] = i
+        receivers.append(rec)
 
     return {
-        "case": 1,
-        "sender": sender_parsed,
-        "receivers": [rec],
-        "total_amount": rec["amount"],
-        "total_qr": 1,
+        "sender": sender,
+        "receivers": receivers,
+        "total_amount": sum(r["amount"] for r in receivers),
+        "total_qr": len(receivers),
     }
 
 
 def generate_order_code() -> str:
     """
-    Format: W + DDHHMMSS[+seq nếu trùng].
+    Format: NO + DDHHMMSS[+seq nếu trùng].
     An toàn với concurrent requests nhờ DB UNIQUE constraint.
     """
-    base = "W" + now_local().strftime("%d%H%M%S")
+    base = "NO" + now_local().strftime("%d%H%M%S")
     conn = db_connect()
     cur = conn.cursor()
     candidate = base
@@ -1025,26 +869,6 @@ def build_caption(order_code: str, parsed: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_caption_single(order_code: str, parsed: Dict[str, Any], r: Dict[str, Any]) -> str:
-    """
-    Caption cho QR duy nhất — 1 chuyển → 1 nhận.
-    """
-    s = parsed["sender"]
-    lines = [
-        f"✅ <b>THÔNG TIN NGƯỜI CHUYỂN</b>",
-        f"<b>{s['name']}</b>  —  {s['bank'].upper()}  —  <code>{s['account']}</code>",
-        "",
-        f"📦 Mã đơn: <b><code>{order_code}</code></b>  |  💰 <code>{format_money(parsed['total_amount'])}</code>",
-        "",
-        f"🏦 <b>THÔNG TIN NGƯỜI NHẬN</b>",
-        f"👤 Tên TK: <b>{r['name']}</b>",
-        f"🏦 Ngân hàng: <b>{r['bank'].upper()}</b>  —  <code>{r['account']}</code>",
-        f"💵 Số tiền: <code>{format_money(r['amount'])}</code>",
-        *([ f"📝 Nội dung: {r['content']}" ] if r.get("content") else []),
-    ]
-    return "\n".join(lines)
-
-
 # ─────────────────────────── SEND QRs ────────────────────────────────────────
 
 def resize_qr(src_path: str, dst_path: str, size: int = 280) -> None:
@@ -1090,46 +914,70 @@ async def send_order_qrs(
     bot: Bot, message: Message, order_code: str, parsed: Dict[str, Any]
 ) -> List[int]:
     """
-    Gửi 1 QR duy nhất (1 chuyển → 1 nhận).
-    QR tạo theo TK người nhận + số tiền.
-    """
-    from aiogram.types import BufferedInputFile
+    Layout đúng (như ảnh mẫu):
+      [QR1][QR2][QR3]  ← tất cả cùng 1 media group, không caption
+      📦 THÔNG TIN...   ← caption gửi riêng 1 tin text ngay sau
 
-    r = parsed["receivers"][0]
+    Tên file: {tên người nhận} {bank} - {số tiền}.png
+    """
+    import io
+    from aiogram.types import InputMediaDocument, BufferedInputFile
+
+    receivers = parsed["receivers"]
+    caption   = build_caption(order_code, parsed)
     sent_ids: List[int] = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        raw_path = os.path.join(tmpdir, f"{order_code}_raw.png")
+        # Download song song
+        raw_paths = [os.path.join(tmpdir, f"{order_code}_{r['index']}_raw.png")
+                     for r in receivers]
+        await asyncio.gather(*[
+            download_vietqr_image(
+                bank=r["bank"], account=r["account"], account_name=r["name"],
+                amount=r["amount"], content=r["content"], output_path=p,
+            )
+            for r, p in zip(receivers, raw_paths)
+        ])
 
-        await download_vietqr_image(
-            bank=r["bank"],
-            account=r["account"],
-            account_name=r["name"],
-            amount=r["amount"],
-            content=r["content"],
-            output_path=raw_path,
-        )
+        # Telegram giới hạn 10 file mỗi media group
+        MAX_GROUP = 10
+        if len(receivers) > MAX_GROUP:
+            await message.reply(
+                f"⚠️ Đơn có <b>{len(receivers)} QR</b> vượt quá giới hạn {MAX_GROUP} của Telegram.\n"
+                f"Vui lòng chia thành nhiều đơn nhỏ hơn.",
+                parse_mode="HTML"
+            )
+            return []
 
-        doc_bytes, thumb_bytes = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _make_qr_bytes_sync(raw_path)
-        )
+        # Build document items — tên file theo tên người nhận
+        # Caption đặt ở QR CUỐI — hiển thị ngay dưới toàn bộ ảnh
+        last_idx = len(receivers) - 1
+        media_group = []
+        for i, (r, raw_p) in enumerate(zip(receivers, raw_paths)):
+            doc_bytes, thumb_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, lambda rp=raw_p: _make_qr_bytes_sync(rp)
+            )
+            fname = safe_filename(
+                f"{r['name']} {r['bank'].upper()} - {format_money(r['amount'])}.png"
+            )
+            doc_buf   = BufferedInputFile(doc_bytes,   filename=fname)
+            thumb_buf = BufferedInputFile(thumb_bytes, filename="t.jpg")
+            media_group.append(InputMediaDocument(
+                media=doc_buf,
+                thumbnail=thumb_buf,
+                caption=caption if i == last_idx else None,
+                parse_mode=ParseMode.HTML if i == last_idx else None,
+            ))
 
-        fname     = safe_filename(f"{r['name']} {r['bank'].upper()} - {format_money(r['amount'])}.png")
-        caption   = build_caption_single(order_code, parsed, r)
-        doc_buf   = BufferedInputFile(doc_bytes,   filename=fname)
-        thumb_buf = BufferedInputFile(thumb_bytes, filename="t.jpg")
-
-        msg = await bot.send_document(
+        # Gửi toàn bộ QR trong 1 media group, caption ở QR cuối
+        msgs = await bot.send_media_group(
             chat_id=message.chat.id,
-            document=doc_buf,
-            thumbnail=thumb_buf,
-            caption=caption,
-            parse_mode=ParseMode.HTML,
+            media=media_group,
             reply_to_message_id=message.message_id,
         )
-        sent_ids.append(msg.message_id)
+        sent_ids = [m.message_id for m in msgs]
 
-        # Inline buttons
+        # Gửi tin nhắn riêng với inline buttons bên dưới
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Đã gửi đơn", callback_data=f"sent:{order_code}"),
@@ -1137,10 +985,10 @@ async def send_order_qrs(
         ]])
         btn_msg = await bot.send_message(
             chat_id=message.chat.id,
-            text=f"📦 <b><code>{order_code}</code></b>  |  <code>{format_money(parsed['total_amount'])}</code>",
+            text=f"📦 <b><code>{order_code}</code></b>  |  {parsed['total_qr']} QR  |  <code>{format_money(parsed['total_amount'])}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
-            reply_to_message_id=msg.message_id,
+            reply_to_message_id=sent_ids[0],
         )
         sent_ids.append(btn_msg.message_id)
 
@@ -1176,10 +1024,8 @@ def save_order_to_db(
 ) -> None:
     conn = db_connect()
     cur = conn.cursor()
-    ts  = now_local().strftime("%Y-%m-%d %H:%M:%S")
-
     s = parsed["sender"]
-    r = parsed["receivers"][0]
+    ts = now_local().strftime("%Y-%m-%d %H:%M:%S")
 
     cur.execute("""
         INSERT INTO orders
@@ -1200,17 +1046,14 @@ def save_order_to_db(
         parsed["total_amount"], parsed["total_qr"],
     ))
 
-    # Lưu 1 receiver duy nhất
-    mid = sent_ids[0] if sent_ids else None
-    cur.execute("""
-        INSERT INTO receivers
-            (order_code, receiver_index, receiver_bank,
-             receiver_account, receiver_name, amount, content, message_id)
-        VALUES (?,?,?,?,?,?,?,?)
-    """, (order_code, r["index"], r["bank"],
-          r["account"], r["name"], r["amount"], r.get("content", ""), mid))
-
-    for mid in sent_ids:
+    for r, mid in zip(parsed["receivers"], sent_ids):
+        cur.execute("""
+            INSERT INTO receivers
+                (order_code, receiver_index, receiver_bank,
+                 receiver_account, receiver_name, amount, content, message_id)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (order_code, r["index"], r["bank"],
+              r["account"], r["name"], r["amount"], r["content"], mid))
         cur.execute("""
             INSERT OR REPLACE INTO order_messages (chat_id, message_id, order_code)
             VALUES (?,?,?)
@@ -1314,8 +1157,7 @@ async def cancel_order(bot: Bot, chat_id: int, order_code: str,
     )
 
     # Nếu đã gửi card sang Group Collect → edit thành "Đã hủy"
-    collect_id = get_collect_group_id(chat_id)
-    if collect_mid and collect_id:
+    if collect_mid and COLLECT_GROUP_ID:
         cancelled_text = (
             f"🚫 <b>ĐƠN ĐÃ HỦY</b>\n"
             f"📦 Mã đơn: <b><code>{order_code}</code></b>\n"
@@ -1324,7 +1166,7 @@ async def cancel_order(bot: Bot, chat_id: int, order_code: str,
         )
         try:
             await bot.edit_message_text(
-                chat_id=collect_id,
+                chat_id=COLLECT_GROUP_ID,
                 message_id=collect_mid,
                 text=cancelled_text,
                 parse_mode="HTML",
@@ -1334,7 +1176,7 @@ async def cancel_order(bot: Bot, chat_id: int, order_code: str,
             # Fallback: reply thông báo vào card
             try:
                 await bot.send_message(
-                    chat_id=collect_id,
+                    chat_id=COLLECT_GROUP_ID,
                     text=f"🚫 <b>Đơn <code>{order_code}</code> đã bị hủy</b> bởi {cancelled_by}",
                     parse_mode="HTML",
                     reply_to_message_id=collect_mid,
@@ -1663,331 +1505,6 @@ def fetch_by_date(date_str_ddmmyyyy: str, chat_id: Optional[int] = None) -> List
     return rows
 
 
-# ─────────────────────────── BILL OCR (Claude Vision) ───────────────────────
-
-BILL_EXTRACT_PROMPT = """You are an expert Vietnamese bank transfer receipt reader.
-
-Return PURE JSON only. No markdown. No backticks. No explanation.
-
-Your job is to extract transaction information from a bank transfer bill / receipt / screenshot / PDF page.
-
-CRITICAL RULES:
-1. receiver_account means the account that RECEIVES money.
-   Vietnamese labels may be:
-   - STK nhận
-   - Số tài khoản nhận
-   - Tài khoản nhận
-   - Người nhận
-   - TK thụ hưởng
-   - Tài khoản thụ hưởng
-   - Beneficiary account
-   - To account
-   - Credited account
-
-2. DO NOT use the sender account as receiver_account.
-   Sender labels may be:
-   - STK chuyển
-   - Số tài khoản chuyển
-   - Tài khoản chuyển
-   - Người chuyển
-   - From account
-   - Debit account
-
-3. amount means the transferred amount in VND.
-   Labels may be:
-   - Số tiền
-   - Số tiền giao dịch
-   - Amount
-   - Transaction amount
-   - Thành tiền
-   Ignore fee, balance, available balance, and account balance.
-
-4. Read account digits exactly. Do not add digits. Do not skip digits.
-5. If an account is masked like 123***789, return null for receiver_account.
-6. If the image is not a bank transfer receipt, set is_bill=false.
-7. If there are multiple amounts, choose the transfer amount, not balance, not fee.
-8. Preserve Vietnamese names without guessing.
-9. Bill may be Vietnamese, English, Chinese, Thai, or mixed language.
-10. If unsure between sender and receiver account, use labels and layout to decide. Never guess.
-
-Return JSON with exactly these fields:
-{
-  "amount": integer or null,
-  "receiver_account": string digits only or null,
-  "receiver_name": string or null,
-  "receiver_bank": string or null,
-  "sender_bank": string or null,
-  "transaction_time": string or null,
-  "is_bill": true or false,
-  "confidence": number from 0 to 1,
-  "note": string or null
-}
-
-Example:
-{"amount":132500000,"receiver_account":"80001684312","receiver_name":"LE HO THI TRUC PHUONG","receiver_bank":"MSB","sender_bank":"HDBank","transaction_time":"12/05/2026 12:22","is_bill":true,"confidence":0.94,"note":null}
-"""
-
-
-@dataclass
-class Bill:
-    amount: Optional[int] = None
-    receiver_account: Optional[str] = None
-    receiver_name: Optional[str] = None
-    receiver_bank: Optional[str] = None
-    sender_bank: Optional[str] = None
-    transaction_time: Optional[str] = None
-    is_bill: bool = True
-    confidence: float = 0.0
-    note: Optional[str] = None
-
-
-SUPPORTED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp"}
-SUPPORTED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
-ORDER_CODE_RE = re.compile(r"\bW\d{7,}\b", re.IGNORECASE)
-
-
-def _img_b64(path: str) -> tuple:
-    ext = Path(path).suffix.lower()
-    mt = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-          ".png": "image/png", ".webp": "image/webp"}.get(ext, "image/jpeg")
-    return base64.standard_b64encode(open(path, "rb").read()).decode(), mt
-
-
-def _only_digits(s: str) -> str:
-    return re.sub(r"\D", "", s or "")
-
-
-def extract_order_code(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
-    m = ORDER_CODE_RE.search(text)
-    return m.group(0).upper() if m else None
-
-
-def _completer_name(message: Message) -> str:
-    if not message.from_user:
-        return "unknown"
-    if message.from_user.username:
-        return f"@{message.from_user.username}"
-    return message.from_user.full_name or str(message.from_user.id)
-
-
-def get_order_by_collect_message(message_id: int) -> Optional[sqlite3.Row]:
-    """Dùng khi nhân viên reply bill trực tiếp vào card collect."""
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT order_code, chat_id, qr_message_id, button_message_id,
-               collect_message_id, status
-        FROM orders
-        WHERE collect_message_id = ?
-    """, (message_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def get_order_by_code_for_confirm(order_code: Optional[str]) -> Optional[sqlite3.Row]:
-    if not order_code:
-        return None
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT order_code, chat_id, qr_message_id, button_message_id,
-               collect_message_id, status
-        FROM orders
-        WHERE order_code = ?
-    """, (order_code.upper(),))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def _json_from_claude_text(raw: str) -> dict:
-    raw = (raw or "").strip()
-    try:
-        return json.loads(raw)
-    except Exception:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        return json.loads(m.group(0)) if m else {}
-
-
-def _resize_for_claude(src_path: str, dst_path: str, max_side: int = 1800) -> None:
-    """
-    Chuẩn hóa ảnh trước khi gửi Claude:
-    - Convert RGB
-    - Resize cạnh dài tối đa 1800px
-    - Lưu JPEG để giảm dung lượng và tăng độ ổn định.
-    """
-    with Image.open(src_path) as img:
-        img = img.convert("RGB")
-        w, h = img.size
-        long_side = max(w, h)
-        if long_side > max_side:
-            scale = max_side / long_side
-            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
-        img.save(dst_path, "JPEG", quality=90, optimize=True)
-
-
-def _pdf_to_images(pdf_path: str, out_dir: str, max_pages: int = 3) -> List[str]:
-    """
-    Convert PDF bill sang ảnh để Claude đọc.
-    Cần package: pypdfium2
-    """
-    try:
-        import pypdfium2 as pdfium
-    except Exception as e:
-        raise RuntimeError("Thiếu thư viện pypdfium2. Hãy thêm pypdfium2 vào requirements.txt") from e
-
-    pdf = pdfium.PdfDocument(pdf_path)
-    paths: List[str] = []
-    total_pages = min(len(pdf), max_pages)
-
-    for i in range(total_pages):
-        page = pdf[i]
-        bitmap = page.render(scale=2.5)
-        pil_image = bitmap.to_pil().convert("RGB")
-        out_path = os.path.join(out_dir, f"pdf_page_{i + 1}.jpg")
-        pil_image.save(out_path, "JPEG", quality=90, optimize=True)
-        paths.append(out_path)
-
-    return paths
-
-
-def call_claude_bill(path: str) -> Bill:
-    """Gọi Claude Vision đọc 1 ảnh bill, trả về Bill dataclass."""
-    if not ANTHROPIC_KEY:
-        raise RuntimeError("Thiếu ANTHROPIC_API_KEY")
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        normalized_path = os.path.join(tmpdir, "bill_normalized.jpg")
-        _resize_for_claude(path, normalized_path)
-        b64, mt = _img_b64(normalized_path)
-
-        msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=800,
-            temperature=0,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": mt, "data": b64}},
-                    {"type": "text", "text": BILL_EXTRACT_PROMPT},
-                ]
-            }]
-        )
-
-    raw = msg.content[0].text.strip()
-    data = _json_from_claude_text(raw)
-
-    amount = data.get("amount")
-    try:
-        amount = int(amount) if amount is not None else None
-    except Exception:
-        amount = parse_amount(str(amount)) if amount else None
-
-    confidence = data.get("confidence", 0)
-    try:
-        confidence = float(confidence or 0)
-    except Exception:
-        confidence = 0.0
-
-    return Bill(
-        amount=amount,
-        receiver_account=_only_digits(str(data.get("receiver_account") or "")) or None,
-        receiver_name=data.get("receiver_name"),
-        receiver_bank=data.get("receiver_bank"),
-        sender_bank=data.get("sender_bank"),
-        transaction_time=data.get("transaction_time"),
-        is_bill=bool(data.get("is_bill", True)),
-        confidence=confidence,
-        note=data.get("note"),
-    )
-
-
-def call_claude_bill_any_file(path: str) -> Bill:
-    """
-    Đọc bill từ ảnh hoặc PDF.
-    - Ảnh: đọc trực tiếp
-    - PDF: convert 1-3 trang đầu sang ảnh, đọc lần lượt, lấy kết quả confidence cao nhất.
-    """
-    ext = Path(path).suffix.lower()
-
-    if ext == ".pdf":
-        with tempfile.TemporaryDirectory() as tmpdir:
-            image_paths = _pdf_to_images(path, tmpdir, max_pages=3)
-            if not image_paths:
-                return Bill(is_bill=False, confidence=0, note="PDF không có trang đọc được")
-
-            best_bill: Optional[Bill] = None
-            for img_path in image_paths:
-                try:
-                    bill = call_claude_bill(img_path)
-                    if best_bill is None or bill.confidence > best_bill.confidence:
-                        best_bill = bill
-                except Exception as e:
-                    logger.warning("OCR PDF page lỗi: %s", e)
-
-            return best_bill or Bill(is_bill=False, confidence=0, note="Không OCR được PDF")
-
-    return call_claude_bill(path)
-
-
-def find_order_by_bill(bill: Bill) -> Optional[sqlite3.Row]:
-    """
-    Tìm đơn 'sent' khớp bill.
-    Điều kiện: STK nhận khớp fuzzy + số tiền khớp chính xác.
-    Nới ngày: hôm nay và hôm qua để tránh bill gửi trễ.
-    """
-    if not bill.receiver_account or not bill.amount:
-        return None
-
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT o.order_code, o.chat_id, o.qr_message_id, o.button_message_id,
-               o.collect_message_id, o.status,
-               r.receiver_account, r.amount
-        FROM orders o
-        JOIN receivers r ON o.order_code = r.order_code
-        WHERE o.status = 'sent'
-          AND o.collect_message_id IS NOT NULL
-          AND date(o.created_at) >= date('now', 'localtime', '-1 day')
-    """)
-    rows = cur.fetchall()
-    conn.close()
-
-    d = _only_digits(bill.receiver_account)
-
-    def stk_match(db_stk: str) -> bool:
-        db_stk = _only_digits(db_stk)
-        if not db_stk:
-            return False
-        # 1. Exact
-        if db_stk == d:
-            return True
-        # 2. Prefix / suffix
-        if db_stk.endswith(d) or db_stk.startswith(d):
-            return True
-        if d.endswith(db_stk) or d.startswith(db_stk):
-            return True
-        # 3. Sliding window >= 7 chữ số chung
-        for sub_len in range(min(len(d), len(db_stk)), 6, -1):
-            for i in range(len(d) - sub_len + 1):
-                if d[i:i + sub_len] in db_stk:
-                    return True
-            break
-        return False
-
-    for row in rows:
-        if stk_match(row["receiver_account"]) and row["amount"] == bill.amount:
-            return row
-
-    return None
-
-
 # ─────────────────────────── DISPATCHER ──────────────────────────────────────
 
 
@@ -1997,7 +1514,7 @@ dp = Dispatcher()
 async def cmd_start(message: Message) -> None:
     """Hướng dẫn sử dụng — hoạt động cả DM lẫn group."""
     text = (
-        "🤖 <b>QRin</b> — Tạo QR chuyển khoản 1-1\n"
+        "🤖 <b>outqrbot V5</b> — Quản trị hệ thống\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
         "🔱 <b>SUPERADMIN</b>\n"
@@ -2013,7 +1530,6 @@ async def cmd_start(message: Message) -> None:
         "/listbank — Xem danh sách TK whitelist\n"
         "/tatbank [STK...] — Tắt 1 hoặc nhiều TK\n"
         "/mobank [STK...] — Mở lại TK\n"
-        "/deletebank [STK...] — Xóa hẳn TK khỏi whitelist\n"
         "/fix [index] [tiền] — Sửa số tiền thực nhận\n"
         "/clearold — Dừng nhắc đơn cũ\n"
         "/checkdon [mã] — Xuất Excel theo mã đơn\n"
@@ -2044,94 +1560,28 @@ async def cmd_kichhoat(message: Message, bot: Bot) -> None:
         await message.reply("❌ Chỉ superadmin mới có thể kích hoạt bot.")
         return
 
-    # Parse collect_group_id từ tham số: /kichhoat -1001234567890
-    parts = (message.text or "").split()
-    collect_group_id = None
-    if len(parts) >= 2:
-        try:
-            collect_group_id = int(parts[1].strip())
-        except ValueError:
-            await message.reply(
-                "❌ Sai cú pháp.\nDùng: <code>/kichhoat [collect_group_id]</code>\n"
-                "Ví dụ: <code>/kichhoat -1009876543210</code>",
-                parse_mode=ParseMode.HTML
-            )
-            return
-    else:
-        # Thử lấy từ COLLECT_GROUPS config nếu có
-        collect_group_id = COLLECT_GROUPS.get(message.chat.id)
-
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
-        INSERT OR REPLACE INTO activated_chats (chat_id, activated_by, activated_at, collect_group_id)
-        VALUES (?,?,?,?)
-    """, (message.chat.id, message.from_user.id,
-          now_local().strftime("%Y-%m-%d %H:%M:%S"), collect_group_id))
+        INSERT OR REPLACE INTO activated_chats (chat_id, activated_by, activated_at)
+        VALUES (?,?,?)
+    """, (message.chat.id, message.from_user.id, now_local().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
 
     g_name = chat_title(message)
     activator = sender_display_name(message)
-    collect_info = f"\n📥 Collect : <code>{collect_group_id}</code>" if collect_group_id else "\n⚠️ Chưa set Group Collect"
     await notify_system(
         bot,
         f"✅ <b>Kích hoạt nhóm mới</b>\n"
         f"🏘 Nhóm : {g_name} (<code>{message.chat.id}</code>)\n"
         f"👤 Bởi  : {activator} (<code>{message.from_user.id}</code>)\n"
         f"🕐 Lúc  : {now_local().strftime('%Y-%m-%d %H:%M:%S')}"
-        f"{collect_info}"
     )
-    reply = "✅ Kích hoạt thành công."
-    if collect_group_id:
-        reply += f"\n📥 Group Collect: <code>{collect_group_id}</code>"
-    else:
-        reply += "\n⚠️ Chưa liên kết Group Collect. Dùng /setcollect để set sau."
-    await message.reply(reply, parse_mode=ParseMode.HTML)
+    await message.reply("✅ Kích hoạt thành công.", parse_mode=ParseMode.HTML)
 
 
-# ── /setcollect — Set Group Collect cho Group QR hiện tại ────────────────────
-@dp.message(Command("setcollect"))
-async def cmd_setcollect(message: Message) -> None:
-    if not message.from_user:
-        return
-    if message.from_user.id not in SUPER_ADMIN_IDS:
-        await message.reply("❌ Chỉ superadmin mới dùng được lệnh này.")
-        return
-
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        await message.reply(
-            "Dùng: <code>/setcollect -1009876543210</code>\n"
-            "Trong đó là chat_id của Group Collect cần liên kết.",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    try:
-        collect_id = int(parts[1].strip())
-    except ValueError:
-        await message.reply("❌ chat_id không hợp lệ.", parse_mode=ParseMode.HTML)
-        return
-
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE activated_chats SET collect_group_id=? WHERE chat_id=?",
-        (collect_id, message.chat.id)
-    )
-    if cur.rowcount == 0:
-        await message.reply("❌ Nhóm này chưa được kích hoạt. Dùng /kichhoat trước.")
-        conn.close()
-        return
-    conn.commit()
-    conn.close()
-    await message.reply(
-        f"✅ Đã liên kết Group Collect: <code>{collect_id}</code>",
-        parse_mode=ParseMode.HTML
-    )
-
-
+# ── /tatbot — Superadmin tắt bot khỏi nhóm ───────────────────────────────────
 @dp.message(Command("tatbot"))
 async def cmd_tatbot(message: Message, bot: Bot) -> None:
     if not message.from_user:
@@ -2203,8 +1653,8 @@ async def cmd_addadmin(message: Message) -> None:
 async def cmd_removeadmin(message: Message) -> None:
     if not message.from_user:
         return
-    if message.from_user.id not in SUPER_ADMIN_IDS:
-        await message.reply("❌ Chỉ superadmin mới có thể xóa admin bot.")
+    if not await is_bot_admin(message.chat.id, message.from_user.id):
+        await message.reply("❌ Bạn không có quyền xóa admin bot.")
         return
 
     target_id = None
@@ -2276,7 +1726,7 @@ async def cmd_checkdon(message: Message) -> None:
 
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.reply("Dùng: /checkdon MÃ_ĐƠN\nVí dụ: /checkdon W01120526")
+        await message.reply("Dùng: /checkdon MÃ_ĐƠN\nVí dụ: /checkdon NO01120526")
         return
 
     code = parts[1].strip().upper()
@@ -2343,13 +1793,14 @@ async def cmd_fix_amount(message: Message, bot: Bot) -> None:
     Format: /fix <index> <số tiền>
     Ví dụ: /fix 2 101,500,000
     """
-    if not is_collect_group(message.chat.id):
+    if message.chat.id != COLLECT_GROUP_ID:
         return
     if not message.from_user:
         return
 
+    # Kiểm tra quyền: superadmin hoặc bot_admin được add bằng /addadmin
     uid = message.from_user.id
-    if not await is_bot_admin(message.chat.id, uid):
+    if not await is_bot_admin(COLLECT_GROUP_ID, uid):
         await message.reply("❌ Chỉ admin bot mới được dùng lệnh /fix.")
         return
 
@@ -2475,7 +1926,7 @@ async def cmd_fix_amount(message: Message, bot: Bot) -> None:
 
     try:
         await bot.edit_message_text(
-            chat_id=message.chat.id,
+            chat_id=COLLECT_GROUP_ID,
             message_id=replied_id,
             text=new_text,
             parse_mode="HTML",
@@ -2538,18 +1989,25 @@ async def handle_whitelist_file(message: Message, bot: Bot) -> None:
         if not line or line.startswith("#"):
             continue
         parts = [p.strip() for p in re.split(r"\s*-\s*", line) if p.strip()]
-        if len(parts) < 3:
+        if len(parts) < 2:
             errors.append(f"Dòng {i}: '{line[:50]}' — không đủ thông tin")
             continue
 
-        # Format mới: CA - Tên TK - STK - Tên Bank
-        # VD: CA A - Hà Khánh Linh - 887630168 - Vikibank
-        # parts[-1] = bank (cuối), parts[-2] = account (STK), phần giữa = name
-        bank    = parts[-1]
-        account = parts[-2]
-        name    = " - ".join(parts[1:-2]) if len(parts) > 3 else parts[1]
-        # parts[0] là mã CA — lưu vào device_code để dùng tham khảo
-        device_code = parts[0]
+        # Format: bank - device_code - name - account
+        # VD: shinhanbank - 1447 - Dương Văn Dũng CO - 700040310032
+        device_code = ""
+        if len(parts) >= 4:
+            bank        = parts[0]
+            device_code = parts[1]            # mã thiết bị
+            name        = " ".join(parts[2:-1])
+            account     = parts[-1]
+        elif len(parts) == 3:
+            bank, name, account = parts[0], parts[1], parts[2]
+        elif len(parts) == 2:
+            bank, name, account = parts[0], "", parts[1]
+        else:
+            errors.append(f"Dòng {i}: '{line[:50]}' — không đọc được")
+            continue
 
         account_clean = re.sub(r"\D", "", account)
         if not account_clean or len(account_clean) < 6:
@@ -2654,9 +2112,8 @@ async def cb_wl_import(callback: CallbackQuery, bot: Bot) -> None:
     )
     await notify_system(bot,
         f"📂 <b>Import whitelist</b>\n"
-        f"✅ {len(records)} TK được import\n"
-        f"👤 @{importer}  •  {ts}\n"
-        f"💬 Từ: {callback.message.chat.title or 'DM'}"
+        f"✅ {len(records)} TK\n"
+        f"👤 @{importer}  •  {ts}"
     )
     await callback.answer("✅ Import thành công!")
 
@@ -2673,109 +2130,41 @@ async def cb_wl_cancel(callback: CallbackQuery) -> None:
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("❌ Đã huỷ import.")
 
-@dp.message(F.photo | F.document)
-async def handle_bill_file(message: Message, bot: Bot) -> None:
+@dp.message(F.photo)
+async def handle_bill_photo(message: Message, bot: Bot) -> None:
     """
-    Xử lý bill trong Group Collect — không OCR.
-    Nhân viên xác nhận bằng cách:
-      1. Gửi ảnh bill kèm mã đơn trong caption (VD: W16044437)
-      2. Reply ảnh bill vào card đơn trong group collect
+    Detect nhân viên reply ảnh vào card đơn trong Group Collect.
+    Bất kỳ ai trong group collect đều có thể xác nhận.
     """
     if not message.from_user:
         return
-    if not is_collect_group(message.chat.id):
+    if message.chat.id != COLLECT_GROUP_ID:
+        return
+    if not message.reply_to_message:
         return
 
-    is_photo = bool(message.photo)
-    doc = message.document
-    mime = (doc.mime_type or "").lower() if doc else ""
-    is_image_doc = bool(doc and mime.startswith("image/"))
+    replied_id = message.reply_to_message.message_id
 
-    if not is_photo and not is_image_doc:
-        return
-
-    caption_text = message.caption or ""
-
-    # Ưu tiên 1: caption có mã đơn
-    code = extract_order_code(caption_text)
-    if code:
-        row = get_order_by_code_for_confirm(code)
-        if not row:
-            await message.reply(
-                f"❌ Không tìm thấy mã đơn <code>{code}</code>.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        await confirm_order_row(bot, row, message, bill=None)
-        return
-
-    # Ưu tiên 2: reply vào card đơn
-    if message.reply_to_message:
-        row = get_order_by_collect_message(message.reply_to_message.message_id)
-        if row:
-            await confirm_order_row(bot, row, message, bill=None)
-            return
-
-    # Không có mã / reply → hướng dẫn
-    await message.reply(
-        "📌 Để xác nhận bill, bạn iu làm 1 trong 2 cách:\n"
-        "1. Gửi ảnh bill kèm mã đơn trong caption, ví dụ: <code>W16044437</code>\n"
-        "2. Reply ảnh bill vào card đơn trong group này 🩷",
-        parse_mode=ParseMode.HTML,
+    # Tìm đơn theo collect_message_id
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT order_code, chat_id, qr_message_id, button_message_id, status FROM orders WHERE collect_message_id=?",
+        (replied_id,)
     )
+    row = cur.fetchone()
+    conn.close()
 
-
-async def confirm_order_row(
-    bot: Bot,
-    row: sqlite3.Row,
-    message: Message,
-    bill: Optional[Bill] = None,
-) -> None:
-    """Xác nhận đơn từ row lấy bằng card collect / mã đơn / auto OCR."""
-    if not row:
-        await message.reply("❌ Không tìm thấy đơn.")
+    if not row or row["status"] in ("completed", "cancelled"):
         return
 
-    if row["status"] in ("completed", "cancelled", "expired"):
-        await message.reply(
-            f"⚠️ Đơn <code>{row['order_code']}</code> đã xử lý rồi. Trạng thái: <b>{row['status']}</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+    order_code  = row["order_code"]
+    qr_chat_id  = row["chat_id"]
+    qr_msg_id   = row["qr_message_id"]
+    btn_msg_id  = row["button_message_id"]
+    completer  = message.from_user.username or message.from_user.full_name or str(message.from_user.id)
+    completed_at = now_local().strftime("%H:%M %d/%m/%Y")
 
-    if not row["collect_message_id"]:
-        await message.reply(
-            f"⚠️ Đơn <code>{row['order_code']}</code> chưa có card collect để cập nhật.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    await _confirm_order(
-        bot=bot,
-        order_code=row["order_code"],
-        collect_mid=row["collect_message_id"],
-        qr_chat_id=row["chat_id"],
-        qr_msg_id=row["qr_message_id"],
-        btn_msg_id=row["button_message_id"],
-        completer=_completer_name(message),
-        completed_at=now_local().strftime("%H:%M  %d/%m/%Y"),
-        reply_to_msg=message,
-        bill=bill,
-    )
-
-async def _confirm_order(
-    bot: Bot,
-    order_code: str,
-    collect_mid: int,
-    qr_chat_id: int,
-    qr_msg_id: Optional[int],
-    btn_msg_id: Optional[int],
-    completer: str,
-    completed_at: str,
-    reply_to_msg: Message,
-    bill: Optional[Bill] = None,
-) -> None:
-    """Confirm đơn: cập nhật DB, edit card, reply ngắn vào bill, update button Group QR."""
     # Cập nhật DB
     conn = db_connect()
     cur = conn.cursor()
@@ -2786,50 +2175,31 @@ async def _confirm_order(
     conn.commit()
     conn.close()
 
-    # Edit card collect
+    # Edit card trong Group Collect — dùng HTML nhất quán với lúc gửi
     new_text = _build_collect_html(
         order_code, status="completed",
         completer=completer, completed_at=completed_at
     )
-    collect_id = get_collect_group_id(qr_chat_id)
     try:
         await bot.edit_message_text(
-            chat_id=collect_id or reply_to_msg.chat.id,
-            message_id=collect_mid,
+            chat_id=COLLECT_GROUP_ID,
+            message_id=replied_id,
             text=new_text,
             parse_mode="HTML",
         )
-    except Exception as e:
-        logger.warning("Không edit được card collect: %s", e)
+    except Exception as edit_err:
+        logger.warning("Không edit được card collect: %s", edit_err)
+        try:
+            await bot.send_message(
+                chat_id=COLLECT_GROUP_ID,
+                text=f"✅ <b>Đã có bill</b> — <code>{order_code}</code> — {completer} — {completed_at}",
+                parse_mode="HTML",
+                reply_to_message_id=replied_id,
+            )
+        except Exception:
+            pass
 
-    # Reply ngắn vào bill
-    # Lấy thông tin đơn để hiển thị
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT o.sender_bank, o.sender_name, o.sender_account,
-               r.receiver_bank, r.receiver_account, r.receiver_name, r.amount
-        FROM orders o JOIN receivers r ON o.order_code = r.order_code
-        WHERE o.order_code = ?
-    """, (order_code,))
-    row = cur.fetchone()
-    conn.close()
-
-    if row:
-        reply_text = (
-            f"✅ <b>Đã xác nhận</b> — <code>{order_code}</code>\n"
-            f"💸 Người chuyển: {row['sender_name']} — {(row['sender_bank'] or '').upper()} — <code>{row['sender_account']}</code>\n"
-            f"📥 Người nhận: {row['receiver_name']} — {(row['receiver_bank'] or '').upper()} — <code>{row['receiver_account']}</code> — <code>{format_money(row['amount'])}</code>"
-        )
-    else:
-        reply_text = f"✅ <b>Đã xác nhận</b> — <code>{order_code}</code>"
-
-    try:
-        await reply_to_msg.reply(reply_text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.warning("Không reply được vào bill: %s", e)
-
-    # Update button Group QR
+    # Update button trong Group QR (dùng button_message_id, không phải qr_message_id)
     target_mid = btn_msg_id or qr_msg_id
     if target_mid and qr_chat_id:
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -2908,45 +2278,6 @@ async def cmd_listbank(message: Message) -> None:
     for i, chunk in enumerate(chunks):
         suffix = f"\n<i>Trang {i+1}/{len(chunks)}</i>" if len(chunks) > 1 else ""
         await message.reply(chunk + suffix, parse_mode=ParseMode.HTML)
-
-
-@dp.message(Command("deletebank"))
-async def cmd_deletebank(message: Message) -> None:
-    """Xóa hẳn 1 hoặc nhiều STK khỏi whitelist. /deletebank STK1 STK2"""
-    if not message.from_user:
-        return
-    is_dm = message.chat.id > 0
-    if not is_dm and not chat_is_active(message.chat.id):
-        return
-    if not await is_bot_admin(0, message.from_user.id):
-        await message.reply("❌ Chỉ admin mới dùng được lệnh này.")
-        return
-
-    parts = message.text.split()[1:]
-    if not parts:
-        await message.reply("Dùng: /deletebank <STK1> <STK2> ...\nVí dụ: /deletebank 9876543210")
-        return
-
-    conn = db_connect()
-    cur = conn.cursor()
-    results = []
-    for stk in parts:
-        stk = stk.strip()
-        cur.execute("SELECT name, bank FROM receiver_whitelist WHERE account=?", (stk,))
-        row = cur.fetchone()
-        if not row:
-            results.append(f"❌ <code>{stk}</code> không có trong whitelist")
-        else:
-            cur.execute("DELETE FROM receiver_whitelist WHERE account=?", (stk,))
-            results.append(f"🗑 <code>{stk}</code> — {row['name']} ({(row['bank'] or '').upper()}) đã xóa")
-    conn.commit()
-    conn.close()
-
-    result_text = "\n".join(results)
-    await message.reply(f"<b>Kết quả /deletebank:</b>\n{result_text}", parse_mode=ParseMode.HTML)
-    await notify_system(message.bot,
-        f"🗑 <b>/deletebank</b> bởi {sender_display_name(message)}\n{result_text}")
-
 
 
 @dp.message(Command("tatbank"))
@@ -3067,9 +2398,8 @@ async def cmd_update(message: Message) -> None:
         "📂 <b>Import whitelist TK</b>\n\n"
         "Bạn iu hãy gửi file <code>.txt</code> danh sách TK cho tui nhé 🩷\n\n"
         "<b>Format mỗi dòng:</b>\n"
-        "<code>CA A - Hà Khánh Linh - 887630168 - Vikibank</code>\n"
-        "<code>CA B - Nguyễn Văn An - 1234567890 - VCB</code>\n\n"
-        "📌 Thứ tự: <b>Mã CA - Tên TK - STK - Tên ngân hàng</b>\n"
+        "<code>VCB - 9876543210 - Nguyễn Văn A</code>\n"
+        "<code>TCB - 1122334455 - Trần Thị B</code>\n\n"
         "⏰ Session hết hạn sau 5 phút.",
         parse_mode=ParseMode.HTML
     )
@@ -3167,29 +2497,21 @@ async def cb_resetdb(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer("✅ Đã xóa sạch!")
 
 
-def check_whitelist(parsed: Dict[str, Any]) -> list:
+def check_whitelist(receivers: list) -> list:
     """
-    Kiểm tra STK người nhận theo WHITELIST_MODE.
-
-    Case 1/3: check từng TK trong parsed["receivers"]
-    Case 2:   check TK người nhận duy nhất = parsed["sender"]
-              (vì parsed["sender"] là TK nhận tiền trong Case 2)
-
-    Modes:
-      blacklist (mặc định): chặn STK có is_active=0
-      strict:               chỉ cho phép STK có is_active=1
+    Kiểm tra STK người nhận theo WHITELIST_MODE:
+      blacklist (mặc định):
+        - Tất cả STK đều được tạo QR
+        - Chỉ chặn STK có trong DB với is_active=0 (đã /tatbank)
+      strict:
+        - Chỉ STK có trong DB với is_active=1 mới được tạo QR
+        - STK không có trong DB → bị chặn
     """
     conn = db_connect()
     cur = conn.cursor()
     errors = []
 
-    case = parsed.get("case", 1)
-    # Case 2: người nhận duy nhất là parsed["sender"]
-    accounts_to_check = (
-        [parsed["sender"]] if case == 2 else parsed["receivers"]
-    )
-
-    for r in accounts_to_check:
+    for r in receivers:
         cur.execute(
             "SELECT is_active FROM receiver_whitelist WHERE account=?",
             (r["account"],)
@@ -3197,6 +2519,7 @@ def check_whitelist(parsed: Dict[str, Any]) -> list:
         row = cur.fetchone()
 
         if WHITELIST_MODE == "strict":
+            # Strict: phải có trong whitelist và is_active=1
             if not row:
                 errors.append(
                     f"⚠️ STK <code>{r['account']}</code> (<b>{r['name']}</b>) "
@@ -3208,6 +2531,7 @@ def check_whitelist(parsed: Dict[str, Any]) -> list:
                     f"đang bị tắt, không thể tạo QR."
                 )
         else:
+            # Blacklist (mặc định): chỉ chặn STK bị tắt
             if row and row["is_active"] == 0:
                 errors.append(
                     f"🔴 STK <code>{r['account']}</code> (<b>{r['name']}</b>) "
@@ -3223,24 +2547,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
         return
 
     text = message.text.strip()
-
-    # ── Xác nhận thủ công trong Group Collect bằng mã đơn ────────────────
-    # Dùng được khi gửi riêng mã đơn, reply mã đơn vào bill/card,
-    # hoặc gõ "xác nhận W16044437" trong group collect.
-    if is_collect_group(message.chat.id) and not text.startswith("/"):
-        code = extract_order_code(text)
-        if code:
-            row = get_order_by_code_for_confirm(code)
-            if not row:
-                await message.reply(
-                    f"❌ Không tìm thấy mã đơn <code>{code}</code>.",
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-
-            await confirm_order_row(bot, row, message, bill=None)
-            return
-
+    # DEBUG — xoá sau khi xác nhận hoạt động
     logger.info(
         "[DEBUG] Nhận message | chat_id=%s | user_id=%s | active=%s | text=%r",
         message.chat.id,
@@ -3331,7 +2638,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
         return
 
     # Kiểm tra whitelist trước khi tạo QR
-    wl_errors = check_whitelist(parsed)
+    wl_errors = check_whitelist(parsed["receivers"])
     if wl_errors:
         await message.reply(
             "❌ <b>Không thể tạo QR:</b>\n" + "\n".join(wl_errors),
@@ -3398,28 +2705,30 @@ async def cb_sent(callback: CallbackQuery, bot: Bot) -> None:
             await callback.answer("Đơn này đã được gửi hoặc xử lý rồi.", show_alert=True)
             return
 
-    # Gửi card vào Group Collect
-    collect_mid = await _send_collect_card(bot, order_code)
+        # Gửi card vào Group Collect
+        logger.info("Gửi collect card: order=%s COLLECT_GROUP_ID=%s", order_code, COLLECT_GROUP_ID)
+        collect_mid = await _send_collect_card(bot, order_code)
+        logger.info("collect_mid=%s", collect_mid)
 
-    # Cập nhật DB
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE orders SET status='sent', collect_message_id=? WHERE order_code=?",
-        (collect_mid, order_code)
-    )
-    conn.commit()
-    conn.close()
+        # Cập nhật DB
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE orders SET status='sent', collect_message_id=? WHERE order_code=?",
+            (collect_mid, order_code)
+        )
+        conn.commit()
+        conn.close()
 
-    # Update button → [⏳ Chờ bill]
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="⏳ Chờ bill...", callback_data=f"noop:{order_code}"),
-        InlineKeyboardButton(text="❌ Hủy đơn",    callback_data=f"cancel:{order_code}"),
-    ]])
-    try:
-        await callback.message.edit_reply_markup(reply_markup=kb)
-    except Exception:
-        pass
+        # Update button → [⏳ Chờ bill]
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⏳ Chờ bill...", callback_data=f"noop:{order_code}"),
+            InlineKeyboardButton(text="❌ Hủy đơn",    callback_data=f"cancel:{order_code}"),
+        ]])
+        try:
+            await callback.message.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
 
         await callback.answer("✅ Đã gửi đơn sang group collect!")
 
@@ -3478,6 +2787,10 @@ async def cb_noop(callback: CallbackQuery) -> None:
 
 def _build_collect_html(order_code: str, status: str = "pending",
                         completer: str = "", completed_at: str = "") -> str:
+    """
+    Build HTML card collect — dùng nhất quán cho cả gửi lần đầu lẫn edit.
+    HTML đơn giản chỉ dùng <b> và <code> để tránh lỗi entities khi edit.
+    """
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("SELECT * FROM orders WHERE order_code=?", (order_code,))
@@ -3492,53 +2805,33 @@ def _build_collect_html(order_code: str, status: str = "pending",
     if not o:
         return ""
 
-    r = receivers[0] if receivers else None
-    amt = r["actual_amount"] if (r and r["actual_amount"]) else (r["amount"] if r else o["total_amount"])
-    fixed_tag = " ✏️" if (r and r["actual_amount"] and r["actual_amount"] != r["amount"]) else ""
-
-    created_time = ""
-    try:
-        created_time = datetime.strptime(o["created_at"], "%Y-%m-%d %H:%M:%S").strftime("%H:%M %d/%m")
-    except Exception:
-        pass
-
-    sender_bank = (o['sender_bank'] or '').upper()
-    recv_bank   = (r['receiver_bank'] or '').upper() if r else ''
-
     lines = [
-        f"🔔 <b>ĐƠN RÚT TIỀN</b> — <code>{order_code}</code> — {created_time}",
-        "─────────────────────────────",
-        f"💸 Người chuyển: {o['sender_name']} — {sender_bank} — <code>{o['sender_account']}</code>",
+        f"📦 Mã đơn: <b><code>{order_code}</code></b>",
+        f"💰 Tổng: <b><code>{format_money(o['total_amount'])}</code></b>  |  {o['total_qr']} QR",
+        f"👤 <b>{o['sender_name']}</b>  —  <b>{(o['sender_bank'] or '').upper()}</b>  —  <code>{o['sender_account']}</code>",
+        "―――――――――――――――――――――――――",
     ]
-    if r:
+    for r in receivers:
+        amt   = r["actual_amount"] if r["actual_amount"] else r["amount"]
+        fixed = " ✏️" if r["actual_amount"] and r["actual_amount"] != r["amount"] else ""
         lines.append(
-            f"📥 Người nhận: {r['receiver_name']} — {recv_bank} — <code>{r['receiver_account']}</code> — <code>{format_money(amt)}</code>{fixed_tag}"
+            f"  {r['receiver_index']}. <b>{r['receiver_name']}</b>"
+            f"  |  <b>{(r['receiver_bank'] or '').upper()}</b>"
+            f"  |  <code>{r['receiver_account']}</code>"
+            f"  |  <b><code>{format_money(amt)}</code></b>{fixed}"
         )
-
+    lines.append("―――――――――――――――――――――――――")
     if status == "completed":
-        lines.append("─────────────────────────────")
-        lines.append(f"✅ <b>Đã có bill</b> — {completer} — {completed_at}")
+        lines.append(f"✅ <b>Đã có bill</b>  —  {completer}  —  {completed_at}")
     else:
-        lines.append("─────────────────────────────")
-        lines.append("⏳ Đang chờ bill — bạn iu gửi ảnh vào group nhé 🩷")
+        lines.append("⏳ Đang chờ bill, bạn iu hãy reply bill vào đây nhé 🩷")
 
     return "\n".join(lines)
 
 
 async def _send_collect_card(bot: Bot, order_code: str) -> Optional[int]:
-    """Gửi card đơn vào Group Collect tương ứng với Group QR của đơn."""
-    # Lấy chat_id của Group QR từ đơn
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT chat_id FROM orders WHERE order_code=?", (order_code,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-
-    collect_id = get_collect_group_id(row["chat_id"])
-    if not collect_id:
-        logger.warning("Đơn %s: Group QR %s chưa có Group Collect", order_code, row["chat_id"])
+    """Gửi card đơn vào COLLECT_GROUP_ID dùng HTML, trả về message_id."""
+    if not COLLECT_GROUP_ID:
         return None
 
     text = _build_collect_html(order_code)
@@ -3547,7 +2840,7 @@ async def _send_collect_card(bot: Bot, order_code: str) -> Optional[int]:
 
     try:
         sent = await bot.send_message(
-            chat_id=collect_id,
+            chat_id=COLLECT_GROUP_ID,
             text=text,
             parse_mode="HTML",
         )
@@ -3619,7 +2912,7 @@ async def _reminder_loop(bot: Bot) -> None:
             cur = conn.cursor()
             cur.execute("""
                 SELECT order_code, created_at, collect_message_id,
-                       total_amount, total_qr, chat_id
+                       total_amount, total_qr
                 FROM orders
                 WHERE status = 'sent'
                   AND collect_message_id IS NOT NULL
@@ -3633,20 +2926,19 @@ async def _reminder_loop(bot: Bot) -> None:
                 try:
                     created = datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S")
                     elapsed = (now - created).total_seconds()
+                    # Nhắc mỗi 30 phút (30p, 60p, 90p...)
                     intervals = int(elapsed // REMIND_BILL_EVERY)
                     if intervals >= 1:
+                        # Tránh gửi trùng trong cùng 1 phút
                         remainder = elapsed % REMIND_BILL_EVERY
-                        if remainder <= 60:
-                            collect_id = get_collect_group_id(row["chat_id"])
-                            if not collect_id:
-                                continue
+                        if remainder <= 60:   # trong vòng 60s đầu của mỗi interval
                             try:
                                 await bot.send_message(
-                                    chat_id=collect_id,
+                                    chat_id=COLLECT_GROUP_ID,
                                     text=(
                                         f"⚠️ Đơn <code>{oc}</code> đã gửi "
                                         f"<b>{int(elapsed//60)} phút</b> rồi mà chưa có bill nha! 🩷\n"
-                                        f"💰 {format_money(row['total_amount'])}"
+                                        f"💰 {format_money(row['total_amount'])}  |  {row['total_qr']} QR"
                                     ),
                                     parse_mode="HTML",
                                     reply_to_message_id=row["collect_message_id"],
@@ -3679,8 +2971,9 @@ async def _reminder_loop(bot: Bot) -> None:
 
 async def _daily_report_loop(bot: Bot) -> None:
     """
-    Tự động xuất báo cáo Excel lúc 12:00 GMT+7 mỗi ngày.
+    Tự động xuất báo cáo Excel cuối ngày lúc 23:30 GMT+7.
     Mỗi Group QR nhận file riêng chỉ chứa đơn của group đó.
+    Đồng thời gửi bản tổng vào COLLECT_GROUP_ID.
     """
     REPORT_HOUR   = 0
     REPORT_MINUTE = 0
@@ -3694,11 +2987,10 @@ async def _daily_report_loop(bot: Bot) -> None:
             if (now.hour == REPORT_HOUR and now.minute >= REPORT_MINUTE
                     and last_report_date != today_str):
 
+                # Báo cáo lúc 00:00 → lấy dữ liệu ngày HÔM QUA
                 from datetime import timedelta
-                report_date = (now - timedelta(days=1)).strftime("%d/%m/%Y")  # ngày hôm qua
+                report_date = (now - timedelta(days=1)).strftime("%d/%m/%Y")
                 safe_date   = (now - timedelta(days=1)).strftime("%d-%m-%Y")
-
-                conn = db_connect()
                 cur = conn.cursor()
                 cur.execute("SELECT DISTINCT chat_id FROM activated_chats")
                 active_chats = [r["chat_id"] for r in cur.fetchall()]
@@ -3707,6 +2999,7 @@ async def _daily_report_loop(bot: Bot) -> None:
                 has_any = False
 
                 for chat_id in active_chats:
+                    # Lấy đơn của riêng group này
                     rows = fetch_by_date(report_date, chat_id=chat_id)
                     if not rows:
                         continue
@@ -3730,10 +3023,13 @@ async def _daily_report_loop(bot: Bot) -> None:
                     )
 
                     with tempfile.TemporaryDirectory() as tmpdir:
-                        fname_xlsx = f"baocao_{safe_date}_{chat_id}.xlsx"
+                        fname_xlsx = f"baocao_{safe_date}.xlsx"
                         fpath = os.path.join(tmpdir, fname_xlsx)
                         export_orders_to_excel(rows, fpath)
 
+                        from aiogram.types import FSInputFile
+
+                        # Gửi về đúng Group QR
                         try:
                             await bot.send_document(
                                 chat_id=chat_id,
@@ -3765,7 +3061,7 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     start_time = now_local().strftime("%Y-%m-%d %H:%M:%S")
-    logger.info("QRin khởi động — superadmins: %s", SUPER_ADMIN_IDS)
+    logger.info("outqrbot V5 khởi động — superadmins: %s", SUPER_ADMIN_IDS)
     # Gửi thông báo khởi động đến group hệ thống
     async def _send_startup():
         await asyncio.sleep(2)
@@ -3784,7 +3080,7 @@ async def main() -> None:
             logger.info("Auto-expired %d đơn cũ khi khởi động", expired_count)
         await notify_system(
             bot,
-            f"🟢 <b>QRin đã khởi động</b>\n"
+            f"🟢 <b>outqrbot V5 đã khởi động</b>\n"
             f"🕐 Lúc : {start_time}\n"
             f"👑 Superadmin : {', '.join(str(x) for x in sorted(SUPER_ADMIN_IDS))}"
         )
