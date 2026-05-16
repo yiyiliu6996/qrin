@@ -63,11 +63,22 @@ def _load_config() -> dict:
     if os.environ.get("BOT_TOKEN"):
         ids_raw = os.environ.get("SUPER_ADMIN_IDS", "")
         super_ids = [int(x.strip()) for x in ids_raw.split(",") if x.strip().isdigit()]
+        # COLLECT_GROUPS: "QR_ID:COLLECT_ID,QR_ID2:COLLECT_ID2"
+        collect_groups_raw = os.environ.get("COLLECT_GROUPS", "")
+        collect_groups = {}
+        for pair in collect_groups_raw.split(","):
+            pair = pair.strip()
+            if ":" in pair:
+                qr_id, col_id = pair.split(":", 1)
+                try:
+                    collect_groups[int(qr_id.strip())] = int(col_id.strip())
+                except ValueError:
+                    pass
         return {
             "BOT_TOKEN":                os.environ["BOT_TOKEN"].strip(),
             "SUPER_ADMIN_IDS":          super_ids,
             "NOTIFY_GROUP_ID":          int(os.environ.get("NOTIFY_GROUP_ID", "0") or 0),
-            "COLLECT_GROUP_ID":         int(os.environ.get("COLLECT_GROUP_ID", "0") or 0),
+            "COLLECT_GROUPS":           collect_groups,
             "DEFAULT_TRANSFER_CONTENT": os.environ.get("DEFAULT_TRANSFER_CONTENT", ""),
             "FORM_COOLDOWN_SECONDS":    int(os.environ.get("FORM_COOLDOWN_SECONDS", "3") or 3),
             "BANK_WHITELIST_ENABLED":   os.environ.get("BANK_WHITELIST_ENABLED", "false").lower() == "true",
@@ -86,15 +97,16 @@ def _load_config() -> dict:
 
 _cfg = _load_config()
 
-BOT_TOKEN:               str      = _cfg["BOT_TOKEN"]
-SUPER_ADMIN_IDS:         set[int] = set(_cfg["SUPER_ADMIN_IDS"])
-NOTIFY_GROUP_ID:         int      = _cfg["NOTIFY_GROUP_ID"]
-COLLECT_GROUP_ID:        int      = _cfg.get("COLLECT_GROUP_ID", 0)
-BANK_WHITELIST_ENABLED:  bool     = bool(_cfg.get("BANK_WHITELIST_ENABLED", False))
-WHITELIST_MODE:          str      = _cfg.get("WHITELIST_MODE", "blacklist")
-DEFAULT_TRANSFER_CONTENT: str     = _cfg.get("DEFAULT_TRANSFER_CONTENT", "")
-FORM_COOLDOWN_SECONDS:   int      = _cfg.get("FORM_COOLDOWN_SECONDS", 3)
-ANTHROPIC_KEY:           str      = os.environ.get("ANTHROPIC_API_KEY", _cfg.get("ANTHROPIC_API_KEY", ""))
+BOT_TOKEN:               str           = _cfg["BOT_TOKEN"]
+SUPER_ADMIN_IDS:         set[int]      = set(_cfg["SUPER_ADMIN_IDS"])
+NOTIFY_GROUP_ID:         int           = _cfg["NOTIFY_GROUP_ID"]
+# Map: QR chat_id → Collect chat_id (có thể nhiều cặp)
+COLLECT_GROUPS:          dict[int,int] = _cfg.get("COLLECT_GROUPS", {})
+BANK_WHITELIST_ENABLED:  bool          = bool(_cfg.get("BANK_WHITELIST_ENABLED", False))
+WHITELIST_MODE:          str           = _cfg.get("WHITELIST_MODE", "blacklist")
+DEFAULT_TRANSFER_CONTENT: str          = _cfg.get("DEFAULT_TRANSFER_CONTENT", "")
+FORM_COOLDOWN_SECONDS:   int           = _cfg.get("FORM_COOLDOWN_SECONDS", 3)
+ANTHROPIC_KEY:           str           = os.environ.get("ANTHROPIC_API_KEY", _cfg.get("ANTHROPIC_API_KEY", ""))
 
 # Validate
 if not BOT_TOKEN:
@@ -142,10 +154,15 @@ def init_db() -> None:
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS activated_chats (
-        chat_id      INTEGER PRIMARY KEY,
-        activated_by INTEGER NOT NULL,
-        activated_at TEXT NOT NULL
+        chat_id          INTEGER PRIMARY KEY,
+        activated_by     INTEGER NOT NULL,
+        activated_at     TEXT NOT NULL,
+        collect_group_id INTEGER
     )""")
+    try:
+        cur.execute("ALTER TABLE activated_chats ADD COLUMN collect_group_id INTEGER")
+    except Exception:
+        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS orders (
@@ -261,7 +278,39 @@ def init_db() -> None:
     conn.close()
     logger.info("DB khởi tạo xong: %s", DB_PATH)
 
-# ─────────────────────────── BANK DATA ───────────────────────────────────────
+def is_collect_group(chat_id: int) -> bool:
+    """Kiểm tra chat_id có phải Group Collect của bất kỳ Group QR nào không."""
+    # Check trong DB
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM activated_chats WHERE collect_group_id=?", (chat_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return True
+    # Check trong config
+    return chat_id in COLLECT_GROUPS.values()
+
+
+def get_qr_group_by_collect(collect_chat_id: int) -> Optional[int]:
+    """Lấy Group QR chat_id tương ứng với collect_chat_id."""
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT chat_id FROM activated_chats WHERE collect_group_id=?", (collect_chat_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return row["chat_id"]
+    for qr_id, col_id in COLLECT_GROUPS.items():
+        if col_id == collect_chat_id:
+            return qr_id
+    return None
+
+
+
+
+
+
 
 # ── Bảng mã ngân hàng: mọi cách gõ → mã chuẩn VietQR ────────────────────────
 BANK_ALIAS: dict[str, str] = {
@@ -1265,7 +1314,8 @@ async def cancel_order(bot: Bot, chat_id: int, order_code: str,
     )
 
     # Nếu đã gửi card sang Group Collect → edit thành "Đã hủy"
-    if collect_mid and COLLECT_GROUP_ID:
+    collect_id = get_collect_group_id(chat_id)
+    if collect_mid and collect_id:
         cancelled_text = (
             f"🚫 <b>ĐƠN ĐÃ HỦY</b>\n"
             f"📦 Mã đơn: <b><code>{order_code}</code></b>\n"
@@ -1274,7 +1324,7 @@ async def cancel_order(bot: Bot, chat_id: int, order_code: str,
         )
         try:
             await bot.edit_message_text(
-                chat_id=COLLECT_GROUP_ID,
+                chat_id=collect_id,
                 message_id=collect_mid,
                 text=cancelled_text,
                 parse_mode="HTML",
@@ -1284,7 +1334,7 @@ async def cancel_order(bot: Bot, chat_id: int, order_code: str,
             # Fallback: reply thông báo vào card
             try:
                 await bot.send_message(
-                    chat_id=COLLECT_GROUP_ID,
+                    chat_id=collect_id,
                     text=f"🚫 <b>Đơn <code>{order_code}</code> đã bị hủy</b> bởi {cancelled_by}",
                     parse_mode="HTML",
                     reply_to_message_id=collect_mid,
@@ -1994,28 +2044,94 @@ async def cmd_kichhoat(message: Message, bot: Bot) -> None:
         await message.reply("❌ Chỉ superadmin mới có thể kích hoạt bot.")
         return
 
+    # Parse collect_group_id từ tham số: /kichhoat -1001234567890
+    parts = (message.text or "").split()
+    collect_group_id = None
+    if len(parts) >= 2:
+        try:
+            collect_group_id = int(parts[1].strip())
+        except ValueError:
+            await message.reply(
+                "❌ Sai cú pháp.\nDùng: <code>/kichhoat [collect_group_id]</code>\n"
+                "Ví dụ: <code>/kichhoat -1009876543210</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+    else:
+        # Thử lấy từ COLLECT_GROUPS config nếu có
+        collect_group_id = COLLECT_GROUPS.get(message.chat.id)
+
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("""
-        INSERT OR REPLACE INTO activated_chats (chat_id, activated_by, activated_at)
-        VALUES (?,?,?)
-    """, (message.chat.id, message.from_user.id, now_local().strftime("%Y-%m-%d %H:%M:%S")))
+        INSERT OR REPLACE INTO activated_chats (chat_id, activated_by, activated_at, collect_group_id)
+        VALUES (?,?,?,?)
+    """, (message.chat.id, message.from_user.id,
+          now_local().strftime("%Y-%m-%d %H:%M:%S"), collect_group_id))
     conn.commit()
     conn.close()
 
     g_name = chat_title(message)
     activator = sender_display_name(message)
+    collect_info = f"\n📥 Collect : <code>{collect_group_id}</code>" if collect_group_id else "\n⚠️ Chưa set Group Collect"
     await notify_system(
         bot,
         f"✅ <b>Kích hoạt nhóm mới</b>\n"
         f"🏘 Nhóm : {g_name} (<code>{message.chat.id}</code>)\n"
         f"👤 Bởi  : {activator} (<code>{message.from_user.id}</code>)\n"
         f"🕐 Lúc  : {now_local().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"{collect_info}"
     )
-    await message.reply("✅ Kích hoạt thành công.", parse_mode=ParseMode.HTML)
+    reply = "✅ Kích hoạt thành công."
+    if collect_group_id:
+        reply += f"\n📥 Group Collect: <code>{collect_group_id}</code>"
+    else:
+        reply += "\n⚠️ Chưa liên kết Group Collect. Dùng /setcollect để set sau."
+    await message.reply(reply, parse_mode=ParseMode.HTML)
 
 
-# ── /tatbot — Superadmin tắt bot khỏi nhóm ───────────────────────────────────
+# ── /setcollect — Set Group Collect cho Group QR hiện tại ────────────────────
+@dp.message(Command("setcollect"))
+async def cmd_setcollect(message: Message) -> None:
+    if not message.from_user:
+        return
+    if message.from_user.id not in SUPER_ADMIN_IDS:
+        await message.reply("❌ Chỉ superadmin mới dùng được lệnh này.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.reply(
+            "Dùng: <code>/setcollect -1009876543210</code>\n"
+            "Trong đó là chat_id của Group Collect cần liên kết.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    try:
+        collect_id = int(parts[1].strip())
+    except ValueError:
+        await message.reply("❌ chat_id không hợp lệ.", parse_mode=ParseMode.HTML)
+        return
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE activated_chats SET collect_group_id=? WHERE chat_id=?",
+        (collect_id, message.chat.id)
+    )
+    if cur.rowcount == 0:
+        await message.reply("❌ Nhóm này chưa được kích hoạt. Dùng /kichhoat trước.")
+        conn.close()
+        return
+    conn.commit()
+    conn.close()
+    await message.reply(
+        f"✅ Đã liên kết Group Collect: <code>{collect_id}</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+
 @dp.message(Command("tatbot"))
 async def cmd_tatbot(message: Message, bot: Bot) -> None:
     if not message.from_user:
@@ -2227,14 +2343,13 @@ async def cmd_fix_amount(message: Message, bot: Bot) -> None:
     Format: /fix <index> <số tiền>
     Ví dụ: /fix 2 101,500,000
     """
-    if message.chat.id != COLLECT_GROUP_ID:
+    if not is_collect_group(message.chat.id):
         return
     if not message.from_user:
         return
 
-    # Kiểm tra quyền: superadmin hoặc bot_admin được add bằng /addadmin
     uid = message.from_user.id
-    if not await is_bot_admin(COLLECT_GROUP_ID, uid):
+    if not await is_bot_admin(message.chat.id, uid):
         await message.reply("❌ Chỉ admin bot mới được dùng lệnh /fix.")
         return
 
@@ -2360,7 +2475,7 @@ async def cmd_fix_amount(message: Message, bot: Bot) -> None:
 
     try:
         await bot.edit_message_text(
-            chat_id=COLLECT_GROUP_ID,
+            chat_id=message.chat.id,
             message_id=replied_id,
             text=new_text,
             parse_mode="HTML",
@@ -2575,7 +2690,7 @@ async def handle_bill_file(message: Message, bot: Bot) -> None:
     """
     if not message.from_user:
         return
-    if message.chat.id != COLLECT_GROUP_ID:
+    if not is_collect_group(message.chat.id):
         return
 
     is_photo = bool(message.photo)
@@ -2767,9 +2882,10 @@ async def _confirm_order(
         order_code, status="completed",
         completer=completer, completed_at=completed_at
     )
+    collect_id = get_collect_group_id(qr_chat_id)
     try:
         await bot.edit_message_text(
-            chat_id=COLLECT_GROUP_ID,
+            chat_id=collect_id or reply_to_msg.chat.id,
             message_id=collect_mid,
             text=new_text,
             parse_mode="HTML",
@@ -3202,7 +3318,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
     # ── Xác nhận thủ công trong Group Collect bằng mã đơn ────────────────
     # Dùng được khi gửi riêng mã đơn, reply mã đơn vào bill/card,
     # hoặc gõ "xác nhận W16044437" trong group collect.
-    if message.chat.id == COLLECT_GROUP_ID and not text.startswith("/"):
+    if is_collect_group(message.chat.id) and not text.startswith("/"):
         code = extract_order_code(text)
         if code:
             row = get_order_by_code_for_confirm(code)
@@ -3501,8 +3617,19 @@ def _build_collect_html(order_code: str, status: str = "pending",
 
 
 async def _send_collect_card(bot: Bot, order_code: str) -> Optional[int]:
-    """Gửi card đơn vào COLLECT_GROUP_ID, trả về message_id."""
-    if not COLLECT_GROUP_ID:
+    """Gửi card đơn vào Group Collect tương ứng với Group QR của đơn."""
+    # Lấy chat_id của Group QR từ đơn
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT chat_id FROM orders WHERE order_code=?", (order_code,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+
+    collect_id = get_collect_group_id(row["chat_id"])
+    if not collect_id:
+        logger.warning("Đơn %s: Group QR %s chưa có Group Collect", order_code, row["chat_id"])
         return None
 
     text = _build_collect_html(order_code)
@@ -3511,7 +3638,7 @@ async def _send_collect_card(bot: Bot, order_code: str) -> Optional[int]:
 
     try:
         sent = await bot.send_message(
-            chat_id=COLLECT_GROUP_ID,
+            chat_id=collect_id,
             text=text,
             parse_mode="HTML",
         )
@@ -3583,7 +3710,7 @@ async def _reminder_loop(bot: Bot) -> None:
             cur = conn.cursor()
             cur.execute("""
                 SELECT order_code, created_at, collect_message_id,
-                       total_amount, total_qr
+                       total_amount, total_qr, chat_id
                 FROM orders
                 WHERE status = 'sent'
                   AND collect_message_id IS NOT NULL
@@ -3597,19 +3724,20 @@ async def _reminder_loop(bot: Bot) -> None:
                 try:
                     created = datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S")
                     elapsed = (now - created).total_seconds()
-                    # Nhắc mỗi 30 phút (30p, 60p, 90p...)
                     intervals = int(elapsed // REMIND_BILL_EVERY)
                     if intervals >= 1:
-                        # Tránh gửi trùng trong cùng 1 phút
                         remainder = elapsed % REMIND_BILL_EVERY
-                        if remainder <= 60:   # trong vòng 60s đầu của mỗi interval
+                        if remainder <= 60:
+                            collect_id = get_collect_group_id(row["chat_id"])
+                            if not collect_id:
+                                continue
                             try:
                                 await bot.send_message(
-                                    chat_id=COLLECT_GROUP_ID,
+                                    chat_id=collect_id,
                                     text=(
                                         f"⚠️ Đơn <code>{oc}</code> đã gửi "
                                         f"<b>{int(elapsed//60)} phút</b> rồi mà chưa có bill nha! 🩷\n"
-                                        f"💰 {format_money(row['total_amount'])}  |  {row['total_qr']} QR"
+                                        f"💰 {format_money(row['total_amount'])}"
                                     ),
                                     parse_mode="HTML",
                                     reply_to_message_id=row["collect_message_id"],
@@ -3642,9 +3770,8 @@ async def _reminder_loop(bot: Bot) -> None:
 
 async def _daily_report_loop(bot: Bot) -> None:
     """
-    Tự động xuất báo cáo Excel cuối ngày lúc 23:30 GMT+7.
+    Tự động xuất báo cáo Excel lúc 12:00 GMT+7 mỗi ngày.
     Mỗi Group QR nhận file riêng chỉ chứa đơn của group đó.
-    Đồng thời gửi bản tổng vào COLLECT_GROUP_ID.
     """
     REPORT_HOUR   = 0
     REPORT_MINUTE = 0
@@ -3658,10 +3785,11 @@ async def _daily_report_loop(bot: Bot) -> None:
             if (now.hour == REPORT_HOUR and now.minute >= REPORT_MINUTE
                     and last_report_date != today_str):
 
-                # Báo cáo lúc 00:00 → lấy dữ liệu ngày HÔM QUA
                 from datetime import timedelta
-                report_date = (now - timedelta(days=1)).strftime("%d/%m/%Y")
+                report_date = (now - timedelta(days=1)).strftime("%d/%m/%Y")  # ngày hôm qua
                 safe_date   = (now - timedelta(days=1)).strftime("%d-%m-%Y")
+
+                conn = db_connect()
                 cur = conn.cursor()
                 cur.execute("SELECT DISTINCT chat_id FROM activated_chats")
                 active_chats = [r["chat_id"] for r in cur.fetchall()]
@@ -3670,7 +3798,6 @@ async def _daily_report_loop(bot: Bot) -> None:
                 has_any = False
 
                 for chat_id in active_chats:
-                    # Lấy đơn của riêng group này
                     rows = fetch_by_date(report_date, chat_id=chat_id)
                     if not rows:
                         continue
@@ -3694,13 +3821,10 @@ async def _daily_report_loop(bot: Bot) -> None:
                     )
 
                     with tempfile.TemporaryDirectory() as tmpdir:
-                        fname_xlsx = f"baocao_{safe_date}.xlsx"
+                        fname_xlsx = f"baocao_{safe_date}_{chat_id}.xlsx"
                         fpath = os.path.join(tmpdir, fname_xlsx)
                         export_orders_to_excel(rows, fpath)
 
-                        from aiogram.types import FSInputFile
-
-                        # Gửi về đúng Group QR
                         try:
                             await bot.send_document(
                                 chat_id=chat_id,
