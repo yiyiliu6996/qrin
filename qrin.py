@@ -1615,26 +1615,67 @@ def fetch_by_date(date_str_ddmmyyyy: str, chat_id: Optional[int] = None) -> List
 
 # ─────────────────────────── BILL OCR (Claude Vision) ───────────────────────
 
-BILL_EXTRACT_PROMPT = """You are a Vietnamese bank transfer bill reader. Extract info from the image and return PURE JSON only, NO markdown, NO backticks.
+BILL_EXTRACT_PROMPT = """You are an expert Vietnamese bank transfer receipt reader.
+
+Return PURE JSON only. No markdown. No backticks. No explanation.
+
+Your job is to extract transaction information from a bank transfer bill / receipt / screenshot / PDF page.
 
 CRITICAL RULES:
-1. receiver_account = account that RECEIVES money (STK nhan / So TK nhan / Beneficiary account)
-   - Look for labels: "So tai khoan nhan", "STK nhan", "Tai khoan nhan", "To account", "Beneficiary"
-   - DO NOT use "Tai khoan chuyen" / "So tai khoan chuyen" / "From account" (that is sender)
-2. Read each digit carefully, do NOT add or skip digits
-3. Bill may be in Vietnamese, Chinese, or English
-4. STK is usually 9-16 digits
+1. receiver_account means the account that RECEIVES money.
+   Vietnamese labels may be:
+   - STK nhận
+   - Số tài khoản nhận
+   - Tài khoản nhận
+   - Người nhận
+   - TK thụ hưởng
+   - Tài khoản thụ hưởng
+   - Beneficiary account
+   - To account
+   - Credited account
 
-Fields:
-- amount: VND integer (e.g. 200000000). Null if unclear.
-- receiver_account: receiving account number DIGITS ONLY, read EXACTLY. Null if unclear.
-- receiver_name: account holder name. Null if unclear.
-- receiver_bank: receiving bank name. Null if unclear.
-- sender_bank: sending bank name. Null if unclear.
-- is_bill: true if this is a bank transfer bill, false otherwise.
+2. DO NOT use the sender account as receiver_account.
+   Sender labels may be:
+   - STK chuyển
+   - Số tài khoản chuyển
+   - Tài khoản chuyển
+   - Người chuyển
+   - From account
+   - Debit account
 
-Example output:
-{"amount":132500000,"receiver_account":"80001684312","receiver_name":"LE HO THI TRUC PHUONG","receiver_bank":"Maritime Bank","sender_bank":"HDBank","is_bill":true}"""
+3. amount means the transferred amount in VND.
+   Labels may be:
+   - Số tiền
+   - Số tiền giao dịch
+   - Amount
+   - Transaction amount
+   - Thành tiền
+   Ignore fee, balance, available balance, and account balance.
+
+4. Read account digits exactly. Do not add digits. Do not skip digits.
+5. If an account is masked like 123***789, return null for receiver_account.
+6. If the image is not a bank transfer receipt, set is_bill=false.
+7. If there are multiple amounts, choose the transfer amount, not balance, not fee.
+8. Preserve Vietnamese names without guessing.
+9. Bill may be Vietnamese, English, Chinese, Thai, or mixed language.
+10. If unsure between sender and receiver account, use labels and layout to decide. Never guess.
+
+Return JSON with exactly these fields:
+{
+  "amount": integer or null,
+  "receiver_account": string digits only or null,
+  "receiver_name": string or null,
+  "receiver_bank": string or null,
+  "sender_bank": string or null,
+  "transaction_time": string or null,
+  "is_bill": true or false,
+  "confidence": number from 0 to 1,
+  "note": string or null
+}
+
+Example:
+{"amount":132500000,"receiver_account":"80001684312","receiver_name":"LE HO THI TRUC PHUONG","receiver_bank":"MSB","sender_bank":"HDBank","transaction_time":"12/05/2026 12:22","is_bill":true,"confidence":0.94,"note":null}
+"""
 
 
 @dataclass
@@ -1644,7 +1685,15 @@ class Bill:
     receiver_name: Optional[str] = None
     receiver_bank: Optional[str] = None
     sender_bank: Optional[str] = None
+    transaction_time: Optional[str] = None
     is_bill: bool = True
+    confidence: float = 0.0
+    note: Optional[str] = None
+
+
+SUPPORTED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp"}
+SUPPORTED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+ORDER_CODE_RE = re.compile(r"\bW\d{7,}\b", re.IGNORECASE)
 
 
 def _img_b64(path: str) -> tuple:
@@ -1658,43 +1707,189 @@ def _only_digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
 
-def call_claude_bill(path: str) -> Bill:
-    """Gọi Claude Vision đọc ảnh bill, trả về Bill dataclass."""
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-    b64, mt = _img_b64(path)
-    msg = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=512,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": mt, "data": b64}},
-                {"type": "text", "text": BILL_EXTRACT_PROMPT},
-            ]
-        }]
-    )
-    raw = msg.content[0].text.strip()
+def extract_order_code(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    m = ORDER_CODE_RE.search(text)
+    return m.group(0).upper() if m else None
+
+
+def _completer_name(message: Message) -> str:
+    if not message.from_user:
+        return "unknown"
+    if message.from_user.username:
+        return f"@{message.from_user.username}"
+    return message.from_user.full_name or str(message.from_user.id)
+
+
+def get_order_by_collect_message(message_id: int) -> Optional[sqlite3.Row]:
+    """Dùng khi nhân viên reply bill trực tiếp vào card collect."""
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT order_code, chat_id, qr_message_id, button_message_id,
+               collect_message_id, status
+        FROM orders
+        WHERE collect_message_id = ?
+    """, (message_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_order_by_code_for_confirm(order_code: Optional[str]) -> Optional[sqlite3.Row]:
+    if not order_code:
+        return None
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT order_code, chat_id, qr_message_id, button_message_id,
+               collect_message_id, status
+        FROM orders
+        WHERE order_code = ?
+    """, (order_code.upper(),))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def _json_from_claude_text(raw: str) -> dict:
+    raw = (raw or "").strip()
     try:
-        data = json.loads(raw)
+        return json.loads(raw)
     except Exception:
         m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(0)) if m else {}
+        return json.loads(m.group(0)) if m else {}
+
+
+def _resize_for_claude(src_path: str, dst_path: str, max_side: int = 1800) -> None:
+    """
+    Chuẩn hóa ảnh trước khi gửi Claude:
+    - Convert RGB
+    - Resize cạnh dài tối đa 1800px
+    - Lưu JPEG để giảm dung lượng và tăng độ ổn định.
+    """
+    with Image.open(src_path) as img:
+        img = img.convert("RGB")
+        w, h = img.size
+        long_side = max(w, h)
+        if long_side > max_side:
+            scale = max_side / long_side
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        img.save(dst_path, "JPEG", quality=90, optimize=True)
+
+
+def _pdf_to_images(pdf_path: str, out_dir: str, max_pages: int = 3) -> List[str]:
+    """
+    Convert PDF bill sang ảnh để Claude đọc.
+    Cần package: pypdfium2
+    """
+    try:
+        import pypdfium2 as pdfium
+    except Exception as e:
+        raise RuntimeError("Thiếu thư viện pypdfium2. Hãy thêm pypdfium2 vào requirements.txt") from e
+
+    pdf = pdfium.PdfDocument(pdf_path)
+    paths: List[str] = []
+    total_pages = min(len(pdf), max_pages)
+
+    for i in range(total_pages):
+        page = pdf[i]
+        bitmap = page.render(scale=2.5)
+        pil_image = bitmap.to_pil().convert("RGB")
+        out_path = os.path.join(out_dir, f"pdf_page_{i + 1}.jpg")
+        pil_image.save(out_path, "JPEG", quality=90, optimize=True)
+        paths.append(out_path)
+
+    return paths
+
+
+def call_claude_bill(path: str) -> Bill:
+    """Gọi Claude Vision đọc 1 ảnh bill, trả về Bill dataclass."""
+    if not ANTHROPIC_KEY:
+        raise RuntimeError("Thiếu ANTHROPIC_API_KEY")
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        normalized_path = os.path.join(tmpdir, "bill_normalized.jpg")
+        _resize_for_claude(path, normalized_path)
+        b64, mt = _img_b64(normalized_path)
+
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": mt, "data": b64}},
+                    {"type": "text", "text": BILL_EXTRACT_PROMPT},
+                ]
+            }]
+        )
+
+    raw = msg.content[0].text.strip()
+    data = _json_from_claude_text(raw)
+
+    amount = data.get("amount")
+    try:
+        amount = int(amount) if amount is not None else None
+    except Exception:
+        amount = parse_amount(str(amount)) if amount else None
+
+    confidence = data.get("confidence", 0)
+    try:
+        confidence = float(confidence or 0)
+    except Exception:
+        confidence = 0.0
 
     return Bill(
-        amount=data.get("amount"),
+        amount=amount,
         receiver_account=_only_digits(str(data.get("receiver_account") or "")) or None,
         receiver_name=data.get("receiver_name"),
         receiver_bank=data.get("receiver_bank"),
         sender_bank=data.get("sender_bank"),
+        transaction_time=data.get("transaction_time"),
         is_bill=bool(data.get("is_bill", True)),
+        confidence=confidence,
+        note=data.get("note"),
     )
+
+
+def call_claude_bill_any_file(path: str) -> Bill:
+    """
+    Đọc bill từ ảnh hoặc PDF.
+    - Ảnh: đọc trực tiếp
+    - PDF: convert 1-3 trang đầu sang ảnh, đọc lần lượt, lấy kết quả confidence cao nhất.
+    """
+    ext = Path(path).suffix.lower()
+
+    if ext == ".pdf":
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_paths = _pdf_to_images(path, tmpdir, max_pages=3)
+            if not image_paths:
+                return Bill(is_bill=False, confidence=0, note="PDF không có trang đọc được")
+
+            best_bill: Optional[Bill] = None
+            for img_path in image_paths:
+                try:
+                    bill = call_claude_bill(img_path)
+                    if best_bill is None or bill.confidence > best_bill.confidence:
+                        best_bill = bill
+                except Exception as e:
+                    logger.warning("OCR PDF page lỗi: %s", e)
+
+            return best_bill or Bill(is_bill=False, confidence=0, note="Không OCR được PDF")
+
+    return call_claude_bill(path)
 
 
 def find_order_by_bill(bill: Bill) -> Optional[sqlite3.Row]:
     """
-    Tìm đơn 'sent' hôm nay khớp với bill.
-    Điều kiện: STK nhận khớp (fuzzy) + số tiền khớp chính xác.
-    Fuzzy STK: exact → prefix/suffix → sliding window >= 7 số (từ botbill).
+    Tìm đơn 'sent' khớp bill.
+    Điều kiện: STK nhận khớp fuzzy + số tiền khớp chính xác.
+    Nới ngày: hôm nay và hôm qua để tránh bill gửi trễ.
     """
     if not bill.receiver_account or not bill.amount:
         return None
@@ -1709,7 +1904,7 @@ def find_order_by_bill(bill: Bill) -> Optional[sqlite3.Row]:
         JOIN receivers r ON o.order_code = r.order_code
         WHERE o.status = 'sent'
           AND o.collect_message_id IS NOT NULL
-          AND date(o.created_at) = date('now', 'localtime')
+          AND date(o.created_at) >= date('now', 'localtime', '-1 day')
     """)
     rows = cur.fetchall()
     conn.close()
@@ -1731,7 +1926,7 @@ def find_order_by_bill(bill: Bill) -> Optional[sqlite3.Row]:
         # 3. Sliding window >= 7 chữ số chung
         for sub_len in range(min(len(d), len(db_stk)), 6, -1):
             for i in range(len(d) - sub_len + 1):
-                if d[i:i+sub_len] in db_stk:
+                if d[i:i + sub_len] in db_stk:
                     return True
             break
         return False
@@ -2363,78 +2558,139 @@ async def cb_wl_cancel(callback: CallbackQuery) -> None:
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.answer("❌ Đã huỷ import.")
 
-@dp.message(F.photo)
-async def handle_bill_photo(message: Message, bot: Bot) -> None:
+@dp.message(F.photo | F.document)
+async def handle_bill_file(message: Message, bot: Bot) -> None:
     """
-    Xử lý ảnh bill trong Group Collect — 3 tầng:
+    Xử lý bill trong Group Collect.
 
-    Tầng 1 (auto): Claude đọc bill → khớp STK + tiền → tự confirm
-    Tầng 2 (không khớp): Reply báo lỗi → nhân viên reply mã đơn vào ảnh đó
-    Tầng 3 (thủ công): Handler F.text bắt reply mã đơn → confirm theo mã
+    Ưu tiên:
+    1. Reply bill vào card collect → xác nhận theo card, OCR chỉ phụ trợ.
+    2. Bill kèm mã đơn trong caption → xác nhận theo mã, OCR chỉ phụ trợ.
+    3. Không có card/mã → Claude đọc bill, auto match STK nhận + số tiền.
+
+    Nhận:
+    - Telegram photo
+    - Document ảnh: jpg/jpeg/png/webp
+    - Document PDF: đọc tối đa 3 trang đầu
     """
     if not message.from_user:
         return
     if message.chat.id != COLLECT_GROUP_ID:
         return
 
-    completer = (f"@{message.from_user.username}"
-                 if message.from_user.username
-                 else message.from_user.full_name or str(message.from_user.id))
-    completed_at = now_local().strftime("%H:%M  %d/%m/%Y")
+    is_photo = bool(message.photo)
+    doc = message.document
+    mime = (doc.mime_type or "").lower() if doc else ""
+    file_name = (doc.file_name or "") if doc else ""
+    ext = Path(file_name).suffix.lower()
+
+    is_image_doc = bool(doc and (mime in SUPPORTED_IMAGE_MIME or ext in SUPPORTED_IMAGE_EXT))
+    is_pdf_doc = bool(doc and (mime == "application/pdf" or ext == ".pdf"))
+
+    if not is_photo and not is_image_doc and not is_pdf_doc:
+        return
+
+    caption_text = message.caption or ""
+
+    # Ưu tiên 1: reply bill vào card collect
+    replied_order = None
+    if message.reply_to_message:
+        replied_order = get_order_by_collect_message(message.reply_to_message.message_id)
+
+    # Ưu tiên 2: bill kèm mã đơn trong caption
+    code = extract_order_code(caption_text)
+    code_order = get_order_by_code_for_confirm(code) if code else None
+
+    direct_order = replied_order or code_order
 
     tmp = None
+    bill: Optional[Bill] = None
+
     try:
-        # Download ảnh
-        file_info = await bot.get_file(message.photo[-1].file_id)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
+        # Download file từ Telegram
+        if is_photo:
+            file_id = message.photo[-1].file_id
+            suffix = ".jpg"
+        else:
+            file_id = doc.file_id
+            if is_pdf_doc:
+                suffix = ".pdf"
+            elif ext:
+                suffix = ext
+            else:
+                suffix = ".jpg"
+
+        file_info = await bot.get_file(file_id)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
             tmp = f.name
         await bot.download_file(file_info.file_path, destination=tmp)
 
-        # Gọi Claude đọc bill
-        bill = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: call_claude_bill(tmp)
-        )
+        # OCR luôn thử đọc, nhưng không bắt buộc nếu có card/mã đơn
+        try:
+            bill = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: call_claude_bill_any_file(tmp)
+            )
+        except anthropic.AuthenticationError:
+            raise
+        except anthropic.RateLimitError:
+            raise
+        except Exception as ocr_err:
+            logger.warning("OCR bill lỗi, thử xác nhận thủ công nếu có card/mã: %s", ocr_err)
+            bill = None
 
-        # Không phải bill → im lặng
+        # Có reply card hoặc caption mã đơn → xác nhận trực tiếp
+        if direct_order:
+            await confirm_order_row(bot, direct_order, message, bill=bill)
+            return
+
+        # Không có card/mã → bắt buộc cần OCR để tự match
+        if not bill:
+            await message.reply(
+                "⚠️ Không đọc được bill.\n\n"
+                "📌 Cách xác nhận thủ công:\n"
+                "1. Reply bill vào card đơn trong group collect\n"
+                "2. Hoặc gửi bill kèm mã đơn, ví dụ: <code>W16044437</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         if not bill.is_bill:
             return
 
-        # Tìm đơn khớp
         matched = find_order_by_bill(bill)
-
         if not matched:
-            # Không khớp → báo lỗi, hướng dẫn thủ công
             err_lines = ["⚠️ <b>Không khớp đơn nào</b>"]
             if bill.receiver_account:
                 err_lines.append(f"STK đọc được: <code>{bill.receiver_account}</code>")
             if bill.amount:
                 err_lines.append(f"Số tiền: <code>{format_money(bill.amount)}</code>")
-            err_lines.append("\n📌 Reply mã đơn vào đây để xác nhận thủ công\nVí dụ: <code>W16044437</code>")
+            if bill.receiver_bank:
+                err_lines.append(f"Bank nhận: <b>{bill.receiver_bank}</b>")
+            if bill.confidence:
+                err_lines.append(f"Độ tin cậy OCR: <code>{bill.confidence:.2f}</code>")
+            if bill.note:
+                err_lines.append(f"Ghi chú OCR: {bill.note}")
+            err_lines.append(
+                "\n📌 Cách xác nhận thủ công:\n"
+                "1. Reply bill vào card đơn\n"
+                "2. Hoặc gửi lại bill kèm mã đơn, ví dụ: <code>W16044437</code>"
+            )
             await message.reply("\n".join(err_lines), parse_mode=ParseMode.HTML)
             return
 
-        # Khớp → confirm
-        await _confirm_order(
-            bot=bot,
-            order_code=matched["order_code"],
-            collect_mid=matched["collect_message_id"],
-            qr_chat_id=matched["chat_id"],
-            qr_msg_id=matched["qr_message_id"],
-            btn_msg_id=matched["button_message_id"],
-            completer=completer,
-            completed_at=completed_at,
-            reply_to_msg=message,
-            bill=bill,
-        )
+        await confirm_order_row(bot, matched, message, bill=bill)
 
     except anthropic.AuthenticationError:
         await message.reply("❌ ANTHROPIC_API_KEY không hợp lệ.")
     except anthropic.RateLimitError:
-        await message.reply("⚠️ API quá tải, thử lại sau.")
+        await message.reply("⚠️ Claude API đang quá tải hoặc hết quota, thử lại sau.")
     except Exception as e:
         logger.error("Lỗi đọc bill: %s", e)
         await message.reply(
-            f"❌ Lỗi đọc bill: {e}\n\n📌 Reply mã đơn vào đây để xác nhận thủ công",
+            f"❌ Lỗi đọc bill: {e}\n\n"
+            "📌 Cách xác nhận thủ công:\n"
+            "1. Reply bill vào card đơn\n"
+            "2. Hoặc gửi bill kèm mã đơn, ví dụ: <code>W16044437</code>",
             parse_mode=ParseMode.HTML,
         )
     finally:
@@ -2444,6 +2700,44 @@ async def handle_bill_photo(message: Message, bot: Bot) -> None:
             except Exception:
                 pass
 
+
+async def confirm_order_row(
+    bot: Bot,
+    row: sqlite3.Row,
+    message: Message,
+    bill: Optional[Bill] = None,
+) -> None:
+    """Xác nhận đơn từ row lấy bằng card collect / mã đơn / auto OCR."""
+    if not row:
+        await message.reply("❌ Không tìm thấy đơn.")
+        return
+
+    if row["status"] in ("completed", "cancelled", "expired"):
+        await message.reply(
+            f"⚠️ Đơn <code>{row['order_code']}</code> đã xử lý rồi. Trạng thái: <b>{row['status']}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not row["collect_message_id"]:
+        await message.reply(
+            f"⚠️ Đơn <code>{row['order_code']}</code> chưa có card collect để cập nhật.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await _confirm_order(
+        bot=bot,
+        order_code=row["order_code"],
+        collect_mid=row["collect_message_id"],
+        qr_chat_id=row["chat_id"],
+        qr_msg_id=row["qr_message_id"],
+        btn_msg_id=row["button_message_id"],
+        completer=_completer_name(message),
+        completed_at=now_local().strftime("%H:%M  %d/%m/%Y"),
+        reply_to_msg=message,
+        bill=bill,
+    )
 
 async def _confirm_order(
     bot: Bot,
@@ -2905,50 +3199,21 @@ async def handle_text(message: Message, bot: Bot) -> None:
 
     text = message.text.strip()
 
-    # ── Xác nhận thủ công trong Group Collect ────────────────────────────────
-    # Nhân viên reply mã đơn (Wxxxxxxxx) vào ảnh bill không khớp
-    if (message.chat.id == COLLECT_GROUP_ID
-            and message.reply_to_message
-            and not text.startswith("/")):
-
-        code_match = re.search(r'\bW\d{7,}\b', text, re.IGNORECASE)
-        if code_match:
-            order_code = code_match.group(0).upper()
-            conn = db_connect()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT order_code, chat_id, qr_message_id, button_message_id, "
-                "collect_message_id, status FROM orders WHERE order_code=?",
-                (order_code,)
-            )
-            row = cur.fetchone()
-            conn.close()
-
+    # ── Xác nhận thủ công trong Group Collect bằng mã đơn ────────────────
+    # Dùng được khi gửi riêng mã đơn, reply mã đơn vào bill/card,
+    # hoặc gõ "xác nhận W16044437" trong group collect.
+    if message.chat.id == COLLECT_GROUP_ID and not text.startswith("/"):
+        code = extract_order_code(text)
+        if code:
+            row = get_order_by_code_for_confirm(code)
             if not row:
-                await message.reply(f"❌ Không tìm thấy mã đơn <code>{order_code}</code>.",
-                                    parse_mode=ParseMode.HTML)
-                return
-            if row["status"] in ("completed", "cancelled"):
-                await message.reply(f"⚠️ Đơn <code>{order_code}</code> đã xử lý rồi.",
-                                    parse_mode=ParseMode.HTML)
+                await message.reply(
+                    f"❌ Không tìm thấy mã đơn <code>{code}</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
 
-            completer = (f"@{message.from_user.username}"
-                         if message.from_user.username
-                         else message.from_user.full_name or str(message.from_user.id))
-            completed_at = now_local().strftime("%H:%M  %d/%m/%Y")
-
-            await _confirm_order(
-                bot=bot,
-                order_code=order_code,
-                collect_mid=row["collect_message_id"],
-                qr_chat_id=row["chat_id"],
-                qr_msg_id=row["qr_message_id"],
-                btn_msg_id=row["button_message_id"],
-                completer=completer,
-                completed_at=completed_at,
-                reply_to_msg=message,
-            )
+            await confirm_order_row(bot, row, message, bill=None)
             return
 
     logger.info(
