@@ -323,7 +323,7 @@ BANK_ALIAS: dict[str, str] = {
     # VietBank
     "vietbank":"vietbank","thuongtin":"vietbank",
     # BaoViet Bank
-    "babvietbank":"bvb","bvb":"bvb","baoviet":"baovietbank",
+    "baovietbank":"baovietbank","baoviet":"baoviet","baoviet":"baovietbank",
     # CBBank
     "cbbank":"cbb","cbb":"cbb","xaydung":"cbb",
     # OceanBank
@@ -363,7 +363,7 @@ BANK_ALIAS: dict[str, str] = {
     # SVB = ShinhanBank (thực tế alias dùng phổ biến)
     "svb": "shbvn",
     # VietCapitalBank
-    "vietcapitalbank":"vcb2","bancviet":"vcb2","banviet":"bvb",
+    "vietcapitalbank":"bvb","bvb":"bvb","banviet":"bvb",
     # ViettelMoney
     "viettelmoney":"viettelm","viettelm":"viettelm",
     # VNPTMoney
