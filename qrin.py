@@ -470,9 +470,10 @@ def _vi_normalize(text: str) -> str:
 def resolve_bank_code(raw: str) -> str:
     key = re.sub(r"[^a-z0-9]", "", raw.lower())
     if key in BANK_ALIAS:
-        return BANK_ALIAS[key]
+        return BANK_ALIAS[key].upper()
     vi_key = _vi_normalize(raw)
-    return BANK_ALIAS.get(vi_key, key)
+    result = BANK_ALIAS.get(vi_key, key)
+    return result.upper()
 
 
 def looks_like_bank(line: str) -> bool:
