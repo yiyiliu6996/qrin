@@ -2690,12 +2690,6 @@ async def cb_wl_cancel(callback: CallbackQuery) -> None:
 
 @dp.message(F.photo | F.document)
 async def handle_bill_file(message: Message, bot: Bot) -> None:
-    """
-    Xử lý bill trong Group Collect — không OCR.
-    Nhân viên xác nhận bằng cách:
-      1. Gửi ảnh bill kèm mã đơn trong caption (VD: W16044437)
-      2. Reply ảnh bill vào card đơn trong group collect
-    """
     if not message.from_user:
         return
     if not is_collect_group(message.chat.id):
@@ -2715,13 +2709,8 @@ async def handle_bill_file(message: Message, bot: Bot) -> None:
     code = extract_order_code(caption_text)
     if code:
         row = get_order_by_code_for_confirm(code)
-        if not row:
-            await message.reply(
-                f"❌ Không tìm thấy mã đơn <code>{code}</code>.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        await confirm_order_row(bot, row, message, bill=None)
+        if row:
+            await confirm_order_row(bot, row, message, bill=None)
         return
 
     # Ưu tiên 2: reply vào card đơn
@@ -2729,15 +2718,6 @@ async def handle_bill_file(message: Message, bot: Bot) -> None:
         row = get_order_by_collect_message(message.reply_to_message.message_id)
         if row:
             await confirm_order_row(bot, row, message, bill=None)
-            return
-
-    # Không có mã / reply → hướng dẫn
-    await message.reply(
-        "📌 Để xác nhận bill, bạn iu làm 1 trong 2 cách:\n"
-        "1. Gửi ảnh bill kèm mã đơn trong caption, ví dụ: <code>W16044437</code>\n"
-        "2. Reply ảnh bill vào card đơn trong group này 🩷",
-        parse_mode=ParseMode.HTML,
-    )
 
 
 async def confirm_order_row(
@@ -2816,33 +2796,6 @@ async def _confirm_order(
         )
     except Exception as e:
         logger.warning("Không edit được card collect: %s", e)
-
-    # Reply ngắn vào bill
-    # Lấy thông tin đơn để hiển thị
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT o.sender_bank, o.sender_name, o.sender_account,
-               r.receiver_bank, r.receiver_account, r.receiver_name, r.amount
-        FROM orders o JOIN receivers r ON o.order_code = r.order_code
-        WHERE o.order_code = ?
-    """, (order_code,))
-    row = cur.fetchone()
-    conn.close()
-
-    if row:
-        reply_text = (
-            f"✅ <b>Đã xác nhận</b> — <code>{order_code}</code>\n"
-            f"💸 Người chuyển: {row['sender_name']} — {(row['sender_bank'] or '').upper()} — <code>{row['sender_account']}</code>\n"
-            f"📥 Người nhận: {row['receiver_name']} — {(row['receiver_bank'] or '').upper()} — <code>{row['receiver_account']}</code> — <code>{format_money(row['amount'])}</code>"
-        )
-    else:
-        reply_text = f"✅ <b>Đã xác nhận</b> — <code>{order_code}</code>"
-
-    try:
-        await reply_to_msg.reply(reply_text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.warning("Không reply được vào bill: %s", e)
 
     # Update button Group QR
     target_mid = btn_msg_id or qr_msg_id
