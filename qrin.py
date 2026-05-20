@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════╗
 ║              QRin  —  by Claude                      ║
-║  Tạo QR chuyển khoản 1-1 qua Telegram Bot            ║
-║  1 TK chuyển → 1 TK nhận, 1 QR mỗi đơn              ║
+║  Tạo QR chuyển khoản qua Telegram Bot                ║
+║  Nhiều TK chuyển → 1 TK nhận, mỗi người 1 QR        ║
 ╚══════════════════════════════════════════════════════╝
 """
 
@@ -161,6 +161,10 @@ def init_db() -> None:
     )""")
     try:
         cur.execute("ALTER TABLE activated_chats ADD COLUMN collect_group_id INTEGER")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE activated_chats ADD COLUMN pinned_report_message_id INTEGER")
     except Exception:
         pass
 
@@ -866,12 +870,25 @@ def _merge_receiver_blocks(raw_blocks: List[List[str]]) -> List[List[str]]:
 
 def parse_order_form(text: str) -> Dict[str, Any]:
     """
-    Parse form 1-1 đơn giản:
+    Parse form nhiều người chuyển → 1 người nhận (Case 2):
 
-      Block 1 (không có số tiền) = người chuyển
-      Block 2 (có số tiền)       = người nhận
+      Các block đầu CÓ số tiền  = từng người chuyển
+      Block CUỐI không có tiền  = người nhận duy nhất
 
-    Tách 2 block bằng dòng trống. Kết quả luôn là 1 QR duy nhất.
+    Mỗi người chuyển → 1 QR riêng (QR hướng về TK người nhận).
+    Tách các block bằng dòng trống.
+
+    Ví dụ:
+      Nguyễn Văn A
+      VCB 1234567890
+      500,000
+
+      Trần Thị B
+      TCB 0987654321
+      300,000
+
+      Lê Văn C
+      HDB 1111111111
     """
     raw_blocks = _raw_blocks_from_text(text)
 
@@ -880,34 +897,37 @@ def parse_order_form(text: str) -> Dict[str, Any]:
 
     if len(raw_blocks) < 2:
         raise ValueError(
-            "Form cần 2 block: người chuyển và người nhận.\n"
-            "Tách 2 block bằng dòng trống.\n\n"
-            "Ví dụ:\n"
-            "Nguyễn Văn A\n"
-            "VCB 1234567890\n\n"
-            "Trần Thị B\n"
-            "TCB 0987654321\n"
-            "500,000"
+            "Form cần ít nhất 2 block.\n"
+            "Các block người chuyển (có số tiền) trước,\n"
+            "block người nhận (không có tiền) ở cuối.\n"
+            "Tách các block bằng dòng trống."
         )
 
-    # ── Block 1: người chuyển (không cần tiền) ────────────────────────────────
-    sender_parsed, _ = _extract_sender_lines(raw_blocks[0])
-    if sender_parsed is None:
+    # ── Block cuối: người nhận (không có tiền) ────────────────────────────────
+    receiver_parsed, _ = _extract_sender_lines(raw_blocks[-1])
+    if receiver_parsed is None:
         raise ValueError(
-            "Không nhận diện được thông tin người chuyển (block 1).\n"
+            "Không nhận diện được thông tin người nhận (block cuối).\n"
             "Cần có: tên tài khoản, ngân hàng, số tài khoản."
         )
 
-    # ── Block 2: người nhận (có tiền) ─────────────────────────────────────────
-    rec = _parse_block_fixed(raw_blocks[1], "người nhận", require_amount=True)
-    rec["index"] = 1
+    # ── Các block trước: người chuyển (có tiền) ───────────────────────────────
+    sender_blocks = _merge_receiver_blocks(raw_blocks[:-1])
+    if not sender_blocks:
+        raise ValueError("Không tìm thấy thông tin người chuyển.")
+
+    senders = []
+    for i, blk in enumerate(sender_blocks, 1):
+        s = _parse_block_fixed(blk, f"người chuyển {i}", require_amount=True)
+        s["index"] = i
+        senders.append(s)
 
     return {
-        "case": 1,
-        "sender": sender_parsed,
-        "receivers": [rec],
-        "total_amount": rec["amount"],
-        "total_qr": 1,
+        "case": 2,
+        "sender": receiver_parsed,   # TK nhận tiền — dùng để tạo QR
+        "receivers": senders,        # Danh sách người chuyển — mỗi người 1 QR
+        "total_amount": sum(s["amount"] for s in senders),
+        "total_qr": len(senders),
     }
 
 
@@ -1040,22 +1060,23 @@ def build_caption(order_code: str, parsed: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_caption_single(order_code: str, parsed: Dict[str, Any], r: Dict[str, Any]) -> str:
+def build_caption_single(order_code: str, parsed: Dict[str, Any], s: Dict[str, Any]) -> str:
     """
-    Caption cho QR duy nhất — 1 chuyển → 1 nhận.
+    Caption cho từng QR — Case 2: nhiều chuyển → 1 nhận.
+    s = người chuyển (có tiền), parsed["sender"] = TK nhận tiền.
     """
-    s = parsed["sender"]
+    recv  = parsed["sender"]
+    total = parsed["total_qr"]
     lines = [
-        f"✅ <b>THÔNG TIN NGƯỜI CHUYỂN</b>",
+        f"👤 <b>NGƯỜI CHUYỂN {s['index']}/{total}</b>",
         f"<b>{s['name']}</b>  —  {s['bank'].upper()}  —  <code>{s['account']}</code>",
+        f"💵 Số tiền: <code>{format_money(s['amount'])}</code>",
+        *([ f"📝 Nội dung: {s['content']}" ] if s.get("content") else []),
         "",
-        f"📦 Mã đơn: <b><code>{order_code}</code></b>  |  💰 <code>{format_money(parsed['total_amount'])}</code>",
+        f"📦 Mã đơn: <b><code>{order_code}</code></b>  |  💰 <code>{format_money(parsed['total_amount'])}</code>  ({total} QR)",
         "",
-        f"🏦 <b>THÔNG TIN NGƯỜI NHẬN</b>",
-        f"👤 Tên TK: <b>{r['name']}</b>",
-        f"🏦 Ngân hàng: <b>{r['bank'].upper()}</b>  —  <code>{r['account']}</code>",
-        f"💵 Số tiền: <code>{format_money(r['amount'])}</code>",
-        *([ f"📝 Nội dung: {r['content']}" ] if r.get("content") else []),
+        f"🏦 <b>NGƯỜI NHẬN</b>",
+        f"<b>{recv['name']}</b>  —  {recv['bank'].upper()}  —  <code>{recv['account']}</code>",
     ]
     return "\n".join(lines)
 
@@ -1105,57 +1126,74 @@ async def send_order_qrs(
     bot: Bot, message: Message, order_code: str, parsed: Dict[str, Any]
 ) -> List[int]:
     """
-    Gửi 1 QR duy nhất (1 chuyển → 1 nhận).
-    QR tạo theo TK người nhận + số tiền.
+    Case 2: nhiều chuyển → 1 nhận.
+    Mỗi người chuyển → 1 QR riêng reply tuần tự.
+    QR hướng về TK người nhận + số tiền từng người chuyển.
+    Button [Đã gửi đơn / Hủy đơn] reply vào QR đầu tiên.
     """
-    from aiogram.types import BufferedInputFile
+    from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 
-    r = parsed["receivers"][0]
+    recv    = parsed["sender"]      # TK nhận
+    senders = parsed["receivers"]   # Danh sách người chuyển
+    total   = parsed["total_qr"]
     sent_ids: List[int] = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        raw_path = os.path.join(tmpdir, f"{order_code}_raw.png")
+        # Download tất cả QR song song
+        raw_paths = [os.path.join(tmpdir, f"{order_code}_{s['index']}_raw.png") for s in senders]
+        await asyncio.gather(*[
+            download_vietqr_image(
+                bank=recv["bank"],
+                account=recv["account"],
+                account_name=recv["name"],
+                amount=s["amount"],
+                content=s.get("content") or DEFAULT_TRANSFER_CONTENT,
+                output_path=raw_paths[i],
+            )
+            for i, s in enumerate(senders)
+        ])
 
-        await download_vietqr_image(
-            bank=r["bank"],
-            account=r["account"],
-            account_name=r["name"],
-            amount=r["amount"],
-            content=r["content"],
-            output_path=raw_path,
-        )
+        first_msg_id = None
+        for i, (s, raw_path) in enumerate(zip(senders, raw_paths)):
+            doc_bytes, thumb_bytes = await asyncio.get_event_loop().run_in_executor(
+                None, lambda rp=raw_path: _make_qr_bytes_sync(rp)
+            )
 
-        doc_bytes, thumb_bytes = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _make_qr_bytes_sync(raw_path)
-        )
+            fname     = safe_filename(f"{s['name']} {s['bank'].upper()} - {format_money(s['amount'])}.png")
+            caption   = build_caption_single(order_code, parsed, s)
+            doc_buf   = BufferedInputFile(doc_bytes,   filename=fname)
+            thumb_buf = BufferedInputFile(thumb_bytes, filename="t.jpg")
 
-        fname     = safe_filename(f"{r['name']} {r['bank'].upper()} - {format_money(r['amount'])}.png")
-        caption   = build_caption_single(order_code, parsed, r)
-        doc_buf   = BufferedInputFile(doc_bytes,   filename=fname)
-        thumb_buf = BufferedInputFile(thumb_bytes, filename="t.jpg")
+            # QR đầu tiên reply vào form gốc, các QR sau reply vào QR trước
+            reply_to = message.message_id if i == 0 else sent_ids[-1]
 
-        msg = await bot.send_document(
-            chat_id=message.chat.id,
-            document=doc_buf,
-            thumbnail=thumb_buf,
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-            reply_to_message_id=message.message_id,
-        )
-        sent_ids.append(msg.message_id)
+            msg = await bot.send_document(
+                chat_id=message.chat.id,
+                document=doc_buf,
+                thumbnail=thumb_buf,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=reply_to,
+            )
+            sent_ids.append(msg.message_id)
+            if i == 0:
+                first_msg_id = msg.message_id
 
-        # Inline buttons
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        # Button reply vào QR đầu tiên
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Đã gửi đơn", callback_data=f"sent:{order_code}"),
             InlineKeyboardButton(text="❌ Hủy đơn",   callback_data=f"cancel:{order_code}"),
         ]])
         btn_msg = await bot.send_message(
             chat_id=message.chat.id,
-            text=f"📦 <b><code>{order_code}</code></b>  |  <code>{format_money(parsed['total_amount'])}</code>",
+            text=(
+                f"📦 <b><code>{order_code}</code></b>  |  "
+                f"{total} QR  |  "
+                f"<code>{format_money(parsed['total_amount'])}</code>"
+            ),
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
-            reply_to_message_id=msg.message_id,
+            reply_to_message_id=first_msg_id,
         )
         sent_ids.append(btn_msg.message_id)
 
@@ -1193,8 +1231,8 @@ def save_order_to_db(
     cur = conn.cursor()
     ts  = now_local().strftime("%Y-%m-%d %H:%M:%S")
 
-    s = parsed["sender"]
-    r = parsed["receivers"][0]
+    # Case 2: parsed["sender"] = TK nhận tiền, parsed["receivers"] = danh sách người chuyển
+    recv = parsed["sender"]   # TK nhận — lưu vào sender_* để _build_collect_html đọc
 
     cur.execute("""
         INSERT INTO orders
@@ -1211,19 +1249,21 @@ def save_order_to_db(
         message.message_id,
         sent_ids[0] if sent_ids else None,
         sent_ids[-1] if sent_ids else None,
-        s["bank"], s["account"], s["name"],
+        recv["bank"], recv["account"], recv["name"],
         parsed["total_amount"], parsed["total_qr"],
     ))
 
-    # Lưu 1 receiver duy nhất
-    mid = sent_ids[0] if sent_ids else None
-    cur.execute("""
-        INSERT INTO receivers
-            (order_code, receiver_index, receiver_bank,
-             receiver_account, receiver_name, amount, content, message_id)
-        VALUES (?,?,?,?,?,?,?,?)
-    """, (order_code, r["index"], r["bank"],
-          r["account"], r["name"], r["amount"], r.get("content", ""), mid))
+    # Lưu từng người chuyển — mỗi người có message_id QR riêng
+    qr_ids = sent_ids[:-1]  # bỏ button_message_id (phần tử cuối)
+    for s in parsed["receivers"]:
+        mid = qr_ids[s["index"] - 1] if s["index"] - 1 < len(qr_ids) else None
+        cur.execute("""
+            INSERT INTO receivers
+                (order_code, receiver_index, receiver_bank,
+                 receiver_account, receiver_name, amount, content, message_id)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (order_code, s["index"], s["bank"],
+              s["account"], s["name"], s["amount"], s.get("content", ""), mid))
 
     for mid in sent_ids:
         cur.execute("""
@@ -1615,6 +1655,98 @@ def export_orders_to_excel(rows: List[sqlite3.Row], output_path: str) -> None:
     ws_sum.column_dimensions["E"].width = 20
 
     ws_sum.freeze_panes = "A3"
+
+    # ── Sheet 3: Bank in / Bank TC ───────────────────────────────────────────
+    ws3 = wb.create_sheet("sheet3")
+
+    # Header row 1: nhóm cột
+    ws3.cell(1, 5,  "Bank in")
+    ws3.cell(1, 13, "Bank TC")
+    for col in [5, 13]:
+        c = ws3.cell(1, col)
+        c.font      = Font(bold=True, name="Calibri", size=10, color="FFFFFF")
+        c.fill      = PatternFill("solid", start_color="1F4E79")
+        c.alignment = Alignment(horizontal="center")
+
+    # Header row 2: tên cột
+    h2 = ["Nhóm", "Thông tin nhận", "Thông tin chuyển", "Mã đơn",
+          "Thu Ngoài", "Thu ", "Chi/Xiafa", "Chi/Rút tiền", "Nạp Cashout", "Khác ", "Ghi chú",
+          "Vách Ngăn",
+          "Thu Ngoài", "Thu ", "Chi/Xiafa", "Xuất Khoản", "Nạp Cashout", "Khác ", "Ghi chú"]
+    ws3.append(h2)
+    _apply_header_row(ws3, row_idx=2)
+
+    # Header row 3: mô tả format
+    ws3.append([
+        "QR-Rút In",
+        "Bank  Tên Người nhận", "Bank  Tên Người Chuyển", "Mã đơn",
+        None, None, None, "số tiền ", None, None, "TC Thông tin nhận Mã đơn",
+        None,
+        None, "Số tiền", None, None, None, None, "Bi Thông tin chuyển mã đơn",
+    ])
+    for col in range(1, 20):
+        c = ws3.cell(3, col)
+        c.font      = Font(italic=True, name="Calibri", size=9, color="595959")
+        c.fill      = PatternFill("solid", start_color="F2F2F2")
+        c.border    = _BORDER
+        c.alignment = Alignment(horizontal="left", wrap_text=True)
+
+    # Dữ liệu — chỉ đơn Hoàn thành
+    completed_rows = [r for r in rows if r["status"] == "completed"]
+    for row in completed_rows:
+        recv_bank = (row["receiver_bank"] or "").upper().strip().rstrip(":")
+        send_bank = (row["sender_bank"]   or "").upper().strip().rstrip(":")
+        recv_name = (row["receiver_name"] or "").strip()
+        send_name = (row["sender_name"]   or "").strip()
+        oc        = row["order_code"] or ""
+        amt       = row["actual_amount"] or row["amount"] or 0
+        grp       = (row["group_name"] or "").upper()
+
+        # Prefix Bi hoặc Bi DN tuỳ tên group
+        bi_prefix = "Bi DN" if "DN" in grp else "Bi"
+
+        thong_tin_nhan   = f"{recv_bank} {recv_name}".strip()
+        thong_tin_chuyen = f"{send_bank} {send_name}".strip()
+        ghi_chu_in       = f"TC {thong_tin_nhan} {oc}"
+        ghi_chu_tc       = f"{bi_prefix} {thong_tin_chuyen} {oc}"
+
+        ws3.append([
+            row["group_name"] or "QR-Rút In",  # A
+            thong_tin_nhan,                      # B
+            thong_tin_chuyen,                    # C
+            oc,                                  # D
+            None,    # E Thu Ngoài
+            None,    # F Thu
+            None,    # G Chi/Xiafa
+            amt,     # H Chi/Rút tiền
+            None,    # I Nạp Cashout
+            None,    # J Khác
+            ghi_chu_in,  # K Ghi chú Bank in
+            None,    # L Vách Ngăn
+            None,    # M Thu Ngoài Bank TC
+            amt,     # N Thu Bank TC
+            None,    # O Chi/Xiafa
+            None,    # P Xuất Khoản
+            None,    # Q Nạp Cashout
+            None,    # R Khác
+            ghi_chu_tc,  # S Ghi chú Bank TC
+        ])
+
+    # Format số tiền cột H và N
+    for r in range(4, ws3.max_row + 1):
+        ws3.cell(r, 8).number_format  = _MONEY_FMT
+        ws3.cell(r, 14).number_format = _MONEY_FMT
+
+    # Style body
+    _apply_body_rows(ws3, start_row=4)
+
+    # Column widths
+    col_widths_3 = [14, 28, 28, 14, 12, 10, 10, 14, 12, 10, 36, 4, 12, 14, 10, 12, 12, 10, 36]
+    for i, w in enumerate(col_widths_3, 1):
+        ws3.column_dimensions[ws3.cell(1, i).column_letter].width = w
+
+    # Freeze: cố định cột L (Vách Ngăn) và hàng 1+2 → freeze tại M3
+    ws3.freeze_panes = "M3"
 
     wb.save(output_path)
     logger.info("Excel đã lưu: %s", output_path)
@@ -3460,27 +3592,28 @@ def _build_collect_html(order_code: str, status: str = "pending",
     if not o:
         return ""
 
-    r = receivers[0] if receivers else None
-    amt = r["actual_amount"] if (r and r["actual_amount"]) else (r["amount"] if r else o["total_amount"])
-    fixed_tag = " ✏️" if (r and r["actual_amount"] and r["actual_amount"] != r["amount"]) else ""
-
     created_time = ""
     try:
         created_time = datetime.strptime(o["created_at"], "%Y-%m-%d %H:%M:%S").strftime("%H:%M %d/%m")
     except Exception:
         pass
 
-    sender_bank = (o['sender_bank'] or '').upper()
-    recv_bank   = (r['receiver_bank'] or '').upper() if r else ''
+    recv_bank = (o['sender_bank'] or '').upper()
 
     lines = [
         f"🔔 <b>ĐƠN RÚT TIỀN</b> — <code>{order_code}</code> — {created_time}",
         "─────────────────────────────",
-        f"💸 Người chuyển: {o['sender_name']} — {sender_bank} — <code>{o['sender_account']}</code>",
+        f"📥 Người nhận: {o['sender_name']} — {recv_bank} — <code>{o['sender_account']}</code>",
+        f"💰 Tổng: <code>{format_money(o['total_amount'])}</code>  |  {o['total_qr']} QR",
+        "─────────────────────────────",
     ]
-    if r:
+
+    for r in receivers:
+        amt       = r["actual_amount"] if r["actual_amount"] else r["amount"]
+        fixed_tag = " ✏️" if (r["actual_amount"] and r["actual_amount"] != r["amount"]) else ""
+        s_bank    = (r['receiver_bank'] or '').upper()
         lines.append(
-            f"📥 Người nhận: {r['receiver_name']} — {recv_bank} — <code>{r['receiver_account']}</code> — <code>{format_money(amt)}</code>{fixed_tag}"
+            f"💸 {r['receiver_name']} — {s_bank} — <code>{r['receiver_account']}</code> — <code>{format_money(amt)}</code>{fixed_tag}"
         )
 
     if status == "completed":
@@ -3647,8 +3780,8 @@ async def _reminder_loop(bot: Bot) -> None:
 
 async def _daily_report_loop(bot: Bot) -> None:
     """
-    Tự động xuất báo cáo Excel lúc 12:00 GMT+7 mỗi ngày.
-    Mỗi Group QR nhận file riêng chỉ chứa đơn của group đó.
+    Tự động xuất báo cáo Excel lúc 00:00 GMT+7 mỗi ngày.
+    Mỗi Group QR nhận file riêng, tháo pin cũ và pin file mới.
     """
     REPORT_HOUR   = 0
     REPORT_MINUTE = 0
@@ -3663,18 +3796,21 @@ async def _daily_report_loop(bot: Bot) -> None:
                     and last_report_date != today_str):
 
                 from datetime import timedelta
-                report_date = (now - timedelta(days=1)).strftime("%d/%m/%Y")  # ngày hôm qua
+                report_date = (now - timedelta(days=1)).strftime("%d/%m/%Y")
                 safe_date   = (now - timedelta(days=1)).strftime("%d-%m-%Y")
 
                 conn = db_connect()
                 cur = conn.cursor()
-                cur.execute("SELECT DISTINCT chat_id FROM activated_chats")
-                active_chats = [r["chat_id"] for r in cur.fetchall()]
+                cur.execute("SELECT chat_id, pinned_report_message_id FROM activated_chats")
+                active_chats = cur.fetchall()
                 conn.close()
 
                 has_any = False
 
-                for chat_id in active_chats:
+                for chat_row in active_chats:
+                    chat_id    = chat_row["chat_id"]
+                    old_pin_id = chat_row["pinned_report_message_id"]
+
                     rows = fetch_by_date(report_date, chat_id=chat_id)
                     if not rows:
                         continue
@@ -3702,8 +3838,9 @@ async def _daily_report_loop(bot: Bot) -> None:
                         fpath = os.path.join(tmpdir, fname_xlsx)
                         export_orders_to_excel(rows, fpath)
 
+                        new_msg = None
                         try:
-                            await bot.send_document(
+                            new_msg = await bot.send_document(
                                 chat_id=chat_id,
                                 document=FSInputFile(fpath, filename=fname_xlsx),
                                 caption=caption,
@@ -3711,6 +3848,41 @@ async def _daily_report_loop(bot: Bot) -> None:
                             )
                         except Exception as e:
                             logger.warning("Gửi báo cáo group %s thất bại: %s", chat_id, e)
+                            continue
+
+                        # Tháo pin cũ
+                        if old_pin_id:
+                            try:
+                                await bot.unpin_chat_message(
+                                    chat_id=chat_id,
+                                    message_id=old_pin_id,
+                                )
+                            except Exception as e:
+                                logger.warning("Tháo pin cũ group %s thất bại: %s", chat_id, e)
+
+                        # Pin file mới (disable_notification để không spam)
+                        new_pin_id = None
+                        if new_msg:
+                            try:
+                                await bot.pin_chat_message(
+                                    chat_id=chat_id,
+                                    message_id=new_msg.message_id,
+                                    disable_notification=True,
+                                )
+                                new_pin_id = new_msg.message_id
+                            except Exception as e:
+                                logger.warning("Pin báo cáo group %s thất bại: %s", chat_id, e)
+
+                        # Lưu message_id vừa pin vào DB
+                        if new_pin_id:
+                            conn = db_connect()
+                            cur = conn.cursor()
+                            cur.execute(
+                                "UPDATE activated_chats SET pinned_report_message_id=? WHERE chat_id=?",
+                                (new_pin_id, chat_id)
+                            )
+                            conn.commit()
+                            conn.close()
 
                     logger.info("Báo cáo %s group %s: %d đơn", today_str, chat_id, total_orders)
 
