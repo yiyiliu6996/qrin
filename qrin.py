@@ -1659,32 +1659,39 @@ def export_orders_to_excel(rows: List[sqlite3.Row], output_path: str) -> None:
     # ── Sheet 3: Bank in / Bank TC ───────────────────────────────────────────
     ws3 = wb.create_sheet("sheet3")
 
-    # Header row 1: nhóm cột
-    ws3.cell(1, 5,  "Bank in")
-    ws3.cell(1, 13, "Bank TC")
-    for col in [5, 13]:
+    # Row 1: nhóm cột — Bank in cột G(7), Bank TC cột O(15)
+    ws3.cell(1, 7,  "Bank in")
+    ws3.cell(1, 15, "Bank TC")
+    for col in [7, 15]:
         c = ws3.cell(1, col)
         c.font      = Font(bold=True, name="Calibri", size=10, color="FFFFFF")
         c.fill      = PatternFill("solid", start_color="1F4E79")
         c.alignment = Alignment(horizontal="center")
 
-    # Header row 2: tên cột
-    h2 = ["Nhóm", "Thông tin nhận", "Thông tin chuyển", "Mã đơn",
-          "Thu Ngoài", "Thu ", "Chi/Xiafa", "Chi/Rút tiền", "Nạp Cashout", "Khác ", "Ghi chú",
-          "Vách Ngăn",
-          "Thu Ngoài", "Thu ", "Chi/Xiafa", "Xuất Khoản", "Nạp Cashout", "Khác ", "Ghi chú"]
+    # Row 2: tên cột
+    h2 = [
+        "Nhóm",
+        "Thông tin nhận", "STK nhận",
+        "Thông tin chuyển", "STK chuyển",
+        "Mã đơn",
+        "Thu Ngoài", "Thu ", "Chi/Xiafa", "Chi/Rút tiền", "Nạp Cashout", "Khác ", "Ghi chú",
+        "Vách Ngăn",
+        "Thu Ngoài", "Thu ", "Chi/Xiafa", "Xuất Khoản", "Nạp Cashout", "Khác ", "Ghi chú",
+    ]
     ws3.append(h2)
     _apply_header_row(ws3, row_idx=2)
 
-    # Header row 3: mô tả format
+    # Row 3: mô tả format
     ws3.append([
         "QR-Rút In",
-        "Bank  Tên Người nhận", "Bank  Tên Người Chuyển", "Mã đơn",
+        "Bank Tên Người nhận", "STK nhận",
+        "Bank Tên Người Chuyển", "STK chuyển",
+        "Mã đơn",
         None, None, None, "số tiền ", None, None, "TC Thông tin nhận Mã đơn",
         None,
         None, "Số tiền", None, None, None, None, "Bi Thông tin chuyển mã đơn",
     ])
-    for col in range(1, 20):
+    for col in range(1, 22):
         c = ws3.cell(3, col)
         c.font      = Font(italic=True, name="Calibri", size=9, color="595959")
         c.fill      = PatternFill("solid", start_color="F2F2F2")
@@ -1698,13 +1705,13 @@ def export_orders_to_excel(rows: List[sqlite3.Row], output_path: str) -> None:
         send_bank = (row["sender_bank"]   or "").upper().strip().rstrip(":")
         recv_name = (row["receiver_name"] or "").strip()
         send_name = (row["sender_name"]   or "").strip()
+        recv_stk  = (row["receiver_account"] or "").strip()
+        send_stk  = (row["sender_account"]   or "").strip()
         oc        = row["order_code"] or ""
         amt       = row["actual_amount"] or row["amount"] or 0
         grp       = (row["group_name"] or "").upper()
 
-        # Prefix Bi hoặc Bi DN tuỳ tên group
-        bi_prefix = "Bi DN" if "DN" in grp else "Bi"
-
+        bi_prefix        = "Bi DN" if "DN" in grp else "Bi"
         thong_tin_nhan   = f"{recv_bank} {recv_name}".strip()
         thong_tin_chuyen = f"{send_bank} {send_name}".strip()
         ghi_chu_in       = f"TC {thong_tin_nhan} {oc}"
@@ -1712,41 +1719,28 @@ def export_orders_to_excel(rows: List[sqlite3.Row], output_path: str) -> None:
 
         ws3.append([
             row["group_name"] or "QR-Rút In",  # A
-            thong_tin_nhan,                      # B
-            thong_tin_chuyen,                    # C
-            oc,                                  # D
-            None,    # E Thu Ngoài
-            None,    # F Thu
-            None,    # G Chi/Xiafa
-            amt,     # H Chi/Rút tiền
-            None,    # I Nạp Cashout
-            None,    # J Khác
-            ghi_chu_in,  # K Ghi chú Bank in
-            None,    # L Vách Ngăn
-            None,    # M Thu Ngoài Bank TC
-            amt,     # N Thu Bank TC
-            None,    # O Chi/Xiafa
-            None,    # P Xuất Khoản
-            None,    # Q Nạp Cashout
-            None,    # R Khác
-            ghi_chu_tc,  # S Ghi chú Bank TC
+            thong_tin_nhan, recv_stk,            # B, C
+            thong_tin_chuyen, send_stk,          # D, E
+            oc,                                  # F
+            None, None, None, amt, None, None, ghi_chu_in,  # G-M
+            None,                                # N
+            None, amt, None, None, None, None, ghi_chu_tc,  # O-U
         ])
 
-    # Format số tiền cột H và N
+    # Format số tiền cột J(10) và P(16)
     for r in range(4, ws3.max_row + 1):
-        ws3.cell(r, 8).number_format  = _MONEY_FMT
-        ws3.cell(r, 14).number_format = _MONEY_FMT
+        ws3.cell(r, 10).number_format = _MONEY_FMT
+        ws3.cell(r, 16).number_format = _MONEY_FMT
 
-    # Style body
     _apply_body_rows(ws3, start_row=4)
 
     # Column widths
-    col_widths_3 = [14, 28, 28, 14, 12, 10, 10, 14, 12, 10, 36, 4, 12, 14, 10, 12, 12, 10, 36]
+    col_widths_3 = [14, 28, 14, 28, 14, 14, 12, 10, 10, 14, 12, 10, 36, 4, 12, 14, 10, 12, 12, 10, 36]
     for i, w in enumerate(col_widths_3, 1):
         ws3.column_dimensions[ws3.cell(1, i).column_letter].width = w
 
-    # Freeze: cố định cột L (Vách Ngăn) và hàng 1+2 → freeze tại M3
-    ws3.freeze_panes = "M3"
+    # Freeze 2 hàng header, không cố định cột
+    ws3.freeze_panes = "A3"
 
     wb.save(output_path)
     logger.info("Excel đã lưu: %s", output_path)
