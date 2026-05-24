@@ -1523,12 +1523,12 @@ def export_orders_to_excel(rows: List[sqlite3.Row], output_path: str) -> None:
             row["created_at"],
             row["group_name"],
             row["creator_name"],
-            row["sender_bank"],
-            row["sender_account"],
-            row["sender_name"],
-            row["receiver_bank"],
+            row["receiver_bank"],      # NH Người chuyển = receiver_* trong DB
             row["receiver_account"],
             row["receiver_name"],
+            row["sender_bank"],        # NH Người nhận = sender_* trong DB
+            row["sender_account"],
+            row["sender_name"],
             row["amount"],
             row["actual_amount"] or row["amount"],
             row["content"],
@@ -1562,22 +1562,23 @@ def export_orders_to_excel(rows: List[sqlite3.Row], output_path: str) -> None:
     recv_detail: dict[str, dict] = {}   # key = "BANK|STK"
     send_detail: dict[str, dict] = {}   # key = "BANK|STK"
     for row in rows:
-        rk = f"{(row['receiver_bank'] or '?').upper()}|{row['receiver_account'] or '?'}"
-        sk = f"{(row['sender_bank'] or '?').upper()}|{row['sender_account'] or '?'}"
+        # sender_* = TK nhận, receiver_* = TK chuyển trong DB
+        rk = f"{(row['sender_bank'] or '?').upper()}|{row['sender_account'] or '?'}"
+        sk = f"{(row['receiver_bank'] or '?').upper()}|{row['receiver_account'] or '?'}"
         if rk not in recv_detail:
             recv_detail[rk] = {
-                "bank": (row["receiver_bank"] or "?").upper(),
-                "stk": row["receiver_account"] or "?",
-                "name": row["receiver_name"] or "?",
+                "bank": (row["sender_bank"] or "?").upper(),
+                "stk": row["sender_account"] or "?",
+                "name": row["sender_name"] or "?",
                 "count": 0, "total": 0,
             }
         recv_detail[rk]["count"] += 1
         recv_detail[rk]["total"] += row["amount"]
         if sk not in send_detail:
             send_detail[sk] = {
-                "bank": (row["sender_bank"] or "?").upper(),
-                "stk": row["sender_account"] or "?",
-                "name": row["sender_name"] or "?",
+                "bank": (row["receiver_bank"] or "?").upper(),
+                "stk": row["receiver_account"] or "?",
+                "name": row["receiver_name"] or "?",
                 "count": 0, "total": 0,
             }
         send_detail[sk]["count"] += 1
@@ -1701,12 +1702,13 @@ def export_orders_to_excel(rows: List[sqlite3.Row], output_path: str) -> None:
     # Dữ liệu — chỉ đơn Hoàn thành
     completed_rows = [r for r in rows if r["status"] == "completed"]
     for row in completed_rows:
-        recv_bank = (row["receiver_bank"] or "").upper().strip().rstrip(":")
-        send_bank = (row["sender_bank"]   or "").upper().strip().rstrip(":")
-        recv_name = (row["receiver_name"] or "").strip()
-        send_name = (row["sender_name"]   or "").strip()
-        recv_stk  = (row["receiver_account"] or "").strip()
-        send_stk  = (row["sender_account"]   or "").strip()
+        # DB lưu: sender_* = TK nhận tiền, receiver_* = TK chuyển tiền (Case 2)
+        recv_bank = (row["sender_bank"]      or "").upper().strip().rstrip(":")
+        recv_name = (row["sender_name"]      or "").strip()
+        recv_stk  = (row["sender_account"]   or "").strip()
+        send_bank = (row["receiver_bank"]    or "").upper().strip().rstrip(":")
+        send_name = (row["receiver_name"]    or "").strip()
+        send_stk  = (row["receiver_account"] or "").strip()
         oc        = row["order_code"] or ""
         amt       = row["actual_amount"] or row["amount"] or 0
         grp       = (row["group_name"] or "").upper()
